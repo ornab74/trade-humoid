@@ -1,0 +1,13 @@
+# Pinned runtime dependencies for trade-humoid.
+# Based on the locked versions used in /home/a41371777/code/humoid-gui-gemma-4
+# and extended with the direct imports used by this app.
+
+litert-lm==0.10.1
+httpx==0.28.0
+cryptography==46.0.1
+psutil==6.1.1
+pennylane==0.41.0
+customtkinter==5.2.2
+numpy==2.4.4
+pandas==2.3.3
+PyJWT==2.10.1
