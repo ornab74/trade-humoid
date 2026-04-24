@@ -60,14 +60,15 @@ except Exception:
     litert_lm = None
 
 try:
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 except Exception as exc:
     raise RuntimeError("cryptography is required.") from exc
 
 
-APP_NAME = "Entropic Coinbase Quantum Intelligence"
+APP_NAME = "Gemma4 ETH-PERP Entropic Quantum Intelligence"
 SETTINGS_PATH = Path("main_eth_perp_quantum_settings.json")
 PRODUCT_CACHE_DB_PATH = Path("coinbase_product_cache.sqlite3")
 MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
@@ -82,6 +83,7 @@ COINBASE_AUTH_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/prod
 COINBASE_PUBLIC_PRODUCTS = "https://api.coinbase.com/api/v3/brokerage/market/products"
 COINBASE_AUTH_PRODUCTS_PATH = "/products"
 COINBASE_ADVANCED_BASE = "https://api.coinbase.com/api/v3/brokerage"
+COINBASE_AUTH_URI_PREFIX = "/api/v3/brokerage"
 COINBASE_INTX_CANDLES = "https://api.international.coinbase.com/api/v1/instruments/{instrument}/candles"
 NETWORK_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0)
 EASTERN_TZ = "US/Eastern"
@@ -536,7 +538,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_order_quote_size": 25.0,
     "default_order_leverage": 3.0,
     "margin_type": "CROSS",
-    "jwt_algorithm": "ES256",
+    "jwt_algorithm": "AUTO",
     "chart_show_ribbon_cloud": True,
     "chart_show_quantum_panel": True,
     "chart_show_ema233": True,
@@ -1372,18 +1374,17 @@ class CoinbaseAdvancedClient:
 
     @staticmethod
     def _extract_api_key_name(value: Any) -> str:
-        """Return the exact CDP API key name expected in JWT iss/sub/kid."""
+        """Return the Coinbase CDP API key identifier used in JWT iss/sub/kid."""
         text = sanitize_structured_text(value or "", max_chars=20000).strip()
         obj = CoinbaseAdvancedClient._json_obj_from_text(text)
         if obj:
-            for key in ("name", "apiKeyName", "api_key_name", "keyName", "key_name"):
+            for key in (
+                "name", "apiKey", "api_key", "apiKeyId", "api_key_id",
+                "apiKeyName", "api_key_name", "keyName", "key_name", "keyId", "key_id", "id",
+            ):
                 candidate = sanitize_structured_text(obj.get(key) or "", max_chars=5000).strip()
                 if candidate:
                     return candidate
-            # Last resort only: older exports/tools may call it id. Coinbase usually wants full 'name'.
-            candidate = sanitize_structured_text(obj.get("id") or obj.get("keyId") or obj.get("key_id") or "", max_chars=5000).strip()
-            if candidate:
-                return candidate
         if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
             text = text[1:-1].strip()
         return text
@@ -1393,7 +1394,10 @@ class CoinbaseAdvancedClient:
         text = str(value or "").strip()
         obj = CoinbaseAdvancedClient._json_obj_from_text(text)
         if obj:
-            for key in ("privateKey", "private_key", "pem", "secret"):
+            for key in (
+                "privateKey", "private_key", "apiKeySecret", "api_key_secret",
+                "keySecret", "key_secret", "secret", "pem",
+            ):
                 candidate = obj.get(key)
                 if candidate:
                     text = str(candidate).strip()
@@ -1415,7 +1419,7 @@ class CoinbaseAdvancedClient:
 
     @staticmethod
     def extract_coinbase_credentials(api_key_input: Any, private_key_input: Any) -> Tuple[str, str, List[str]]:
-        """Accept separate fields or a pasted CDP JSON key and return (api_key_name, private_key_pem, notes)."""
+        """Accept separate fields or pasted CDP JSON and return (api_key_id/name, secret/private_key, notes)."""
         notes: List[str] = []
         api_text = str(api_key_input or "").strip()
         key_text = str(private_key_input or "").strip()
@@ -1431,10 +1435,48 @@ class CoinbaseAdvancedClient:
                 api_key = from_json_api
             if from_json_key and (not private_key or key_obj):
                 private_key = from_json_key
-            notes.append("Detected Coinbase CDP JSON key export and extracted name/privateKey fields.")
-        if api_key and not api_key.startswith("organizations/"):
-            notes.append("API key does not look like the full CDP name organizations/{org}/apiKeys/{key}; Coinbase may return 401 key unrecognized.")
+            notes.append("Detected Coinbase key JSON and extracted the API key identifier plus privateKey/secret.")
+        if api_key and not (api_key.startswith("organizations/") or re.fullmatch(r"[0-9a-fA-F-]{32,80}", api_key)):
+            notes.append("API key identifier does not look like a full CDP name or UUID; Coinbase may return 401 key unrecognized.")
         return api_key.strip(), private_key.strip(), notes
+
+    @staticmethod
+    def _auth_request_path(path: str) -> str:
+        """Coinbase JWT uris must sign the full REST path, including /api/v3/brokerage."""
+        clean = sanitize_structured_text(path or "", max_chars=1000).strip()
+        if not clean.startswith("/"):
+            clean = "/" + clean
+        if clean.startswith(COINBASE_AUTH_URI_PREFIX + "/") or clean == COINBASE_AUTH_URI_PREFIX:
+            return clean
+        return COINBASE_AUTH_URI_PREFIX + clean
+
+    @staticmethod
+    def _private_key_signing_material(secret: str, algorithm: str) -> Tuple[str, str]:
+        """Normalize Coinbase ECDSA PEM or Ed25519 secret for PyJWT."""
+        alg = (algorithm or "AUTO").strip()
+        text = CoinbaseAdvancedClient._normalize_private_key_input(secret)
+        if alg.upper() == "AUTO":
+            if "BEGIN EC PRIVATE KEY" in text:
+                alg = "ES256"
+            elif "BEGIN PRIVATE KEY" in text:
+                alg = "EdDSA"
+            else:
+                alg = "EdDSA"
+        if alg == "EdDSA" and "BEGIN" not in text:
+            compact = re.sub(r"\s+", "", text)
+            try:
+                raw = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=False)
+                if len(raw) >= 32:
+                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+                    pem = key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    ).decode("utf-8")
+                    return alg, pem
+            except Exception:
+                pass
+        return alg, text
 
     @staticmethod
     def _looks_like_private_key_error(exc: Exception) -> bool:
@@ -1460,21 +1502,23 @@ class CoinbaseAdvancedClient:
             self.secrets.get("coinbase_api_key") or "",
             self.secrets.get("coinbase_private_key") or "",
         )
-        algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "ES256"), max_chars=24).strip() or "ES256"
+        configured_algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "AUTO"), max_chars=24).strip() or "AUTO"
         if not api_key or not private_key:
             raise RuntimeError("Coinbase credentials are required.")
+        algorithm, signing_key = self._private_key_signing_material(private_key, configured_algorithm)
+        request_path = self._auth_request_path(path)
         now = int(time.time())
         payload = {
             "iss": api_key,
             "sub": api_key,
             "nbf": now,
             "iat": now,
-            "exp": now + 60,
+            "exp": now + 120,
             "aud": "retail_rest_api",
-            "uris": [f"{method.upper()} api.coinbase.com{path}"],
+            "uris": [f"{method.upper()} api.coinbase.com{request_path}"],
         }
         try:
-            token = jwt.encode(payload, private_key, algorithm=algorithm, headers={"kid": api_key})
+            token = jwt.encode(payload, signing_key, algorithm=algorithm, headers={"kid": api_key, "nonce": uuid.uuid4().hex})
         except Exception as exc:
             if self._looks_like_private_key_error(exc):
                 raise RuntimeError(self._friendly_private_key_error()) from exc
@@ -1491,6 +1535,15 @@ class CoinbaseAdvancedClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def test_authentication(self) -> Tuple[bool, str]:
+        """Make a small authenticated request and return a readable result."""
+        try:
+            payload = self._private_request("GET", "/accounts", None)
+            count = len(payload.get("accounts", [])) if isinstance(payload, dict) else 0
+            return True, f"Coinbase auth OK. Accounts endpoint returned {count} account(s)."
+        except Exception as exc:
+            return False, self._format_request_error(exc)
 
     def list_products(self, *, master_key: Optional[bytes] = None, cache: Optional[EncryptedProductStore] = None) -> List[Dict[str, Any]]:
         """Load Coinbase products, including expiring CFM futures such as NOL-18MAY26-CDE."""
@@ -4068,18 +4121,27 @@ class App(ctk.CTk):
         self.trade_reference_combo = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("reference_product_id", "ETH-USD"))], state="normal")
         self.trade_reference_combo.set(str(self.settings.data.get("reference_product_id", "ETH-USD")))
 
-        self.order_side = ctk.CTkComboBox(tab, values=["BUY", "SELL"])
+        order_card = ctk.CTkFrame(tab, fg_color=THEME["card"], corner_radius=16)
+        order_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
+        order_card.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(order_card, text="Order Ticket", text_color=THEME["text"], font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(order_card, text="Side", text_color=THEME["muted"]).grid(row=1, column=0, sticky="w", padx=12, pady=(6, 0))
+        ctk.CTkLabel(order_card, text="Quote Size (USD)", text_color=THEME["muted"]).grid(row=1, column=1, sticky="w", padx=12, pady=(6, 0))
+        self.order_side = ctk.CTkComboBox(order_card, values=["BUY", "SELL"])
         self.order_side.set("BUY")
-        self.order_side.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=6)
-        self.order_quote_size = ctk.CTkEntry(tab, placeholder_text="Quote size in USD")
+        self.order_side.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=(2, 8))
+        self.order_quote_size = ctk.CTkEntry(order_card, placeholder_text="Example: 25")
         self.order_quote_size.insert(0, str(self.settings.data.get("default_order_quote_size", 25.0)))
-        self.order_quote_size.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=6)
-        self.order_leverage = ctk.CTkEntry(tab, placeholder_text="Leverage")
+        self.order_quote_size.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=(2, 8))
+        ctk.CTkLabel(order_card, text="Leverage", text_color=THEME["muted"]).grid(row=3, column=0, sticky="w", padx=12, pady=(2, 0))
+        ctk.CTkLabel(order_card, text="Margin Type", text_color=THEME["muted"]).grid(row=3, column=1, sticky="w", padx=12, pady=(2, 0))
+        self.order_leverage = ctk.CTkEntry(order_card, placeholder_text="Example: 3")
         self.order_leverage.insert(0, str(self.settings.data.get("default_order_leverage", 3.0)))
-        self.order_leverage.grid(row=3, column=0, sticky="ew", padx=(12, 6), pady=6)
-        self.margin_type_combo = ctk.CTkComboBox(tab, values=["CROSS", "ISOLATED", ""])
+        self.order_leverage.grid(row=4, column=0, sticky="ew", padx=(12, 6), pady=(2, 10))
+        self.margin_type_combo = ctk.CTkComboBox(order_card, values=["CROSS", "ISOLATED", ""])
         self.margin_type_combo.set(str(self.settings.data.get("margin_type", "CROSS")))
-        self.margin_type_combo.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=6)
+        self.margin_type_combo.grid(row=4, column=1, sticky="ew", padx=(6, 12), pady=(2, 10))
+
         self.autonomy_size_label = ctk.CTkLabel(tab, text="—", text_color=THEME["text"])
         ctk.CTkLabel(tab, text="Autonomy Proposed Size", text_color=THEME["muted"]).grid(row=4, column=0, sticky="w", padx=12, pady=(2, 0))
         self.autonomy_size_label.grid(row=4, column=1, sticky="w", padx=12, pady=(2, 0))
@@ -4198,10 +4260,11 @@ class App(ctk.CTk):
         ctk.CTkButton(key_actions, text="Paste Key", command=self._paste_private_key_from_clipboard, width=108, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
         ctk.CTkButton(key_actions, text="Load Key File", command=self._load_private_key_file, width=118, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=6)
         ctk.CTkButton(key_actions, text="Clear", command=self._clear_private_key_value, width=86, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(key_actions, text="Test Auth", command=self.test_coinbase_auth_action, width=98, height=30, fg_color=THEME["accent_2"], text_color="#08131f").pack(side="left", padx=(6, 0))
         row += 1
 
         ctk.CTkLabel(tab, text="JWT Algorithm", text_color=THEME["muted"]).grid(row=row, column=0, sticky="w", padx=12, pady=6)
-        self.jwt_algo_combo = ctk.CTkComboBox(tab, values=["ES256", "EdDSA"])
+        self.jwt_algo_combo = ctk.CTkComboBox(tab, values=["AUTO", "ES256", "EdDSA"])
         self.jwt_algo_combo.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
         row += 1
 
@@ -5020,6 +5083,24 @@ class App(ctk.CTk):
     def unlock_secrets(self) -> None:
         self.ensure_secrets_unlocked()
 
+    def test_coinbase_auth_action(self) -> None:
+        raw_api_key = self.coinbase_api_key_entry.get().strip() if hasattr(self, "coinbase_api_key_entry") else ""
+        raw_private_key = self._get_private_key_value() if hasattr(self, "coinbase_private_key_box") else ""
+        api_key, private_key, notes = CoinbaseAdvancedClient.extract_coinbase_credentials(raw_api_key, raw_private_key)
+        if not api_key or not private_key:
+            if not self.ensure_secrets_unlocked():
+                return
+        else:
+            self.coinbase.set_secrets({"coinbase_api_key": api_key, "coinbase_private_key": private_key})
+        for note in notes:
+            self._append_settings_status(note)
+        ok, message = self.coinbase.test_authentication()
+        self._append_settings_status(message)
+        if ok:
+            messagebox.showinfo("Coinbase Auth", message)
+        else:
+            messagebox.showerror("Coinbase Auth Failed", message)
+
     def save_settings_action(self) -> None:
         self.settings.data["product_id"] = self._extract_product_id_from_widget(self.product_id_entry, "ETH-PERP")
         self.settings.data["reference_product_id"] = self._extract_product_id_from_widget(self.reference_product_entry, "ETH-USD")
@@ -5036,7 +5117,7 @@ class App(ctk.CTk):
         self.settings.data["autonomy_cooldown_seconds"] = max(20, int(safe_float(self.autonomy_cooldown_entry.get(), 420)))
         self.settings.data["margin_type"] = self.margin_type_combo.get().strip() or "CROSS"
         self.settings.data["model_path"] = self.model_path_entry.get().strip() or DEFAULT_MODEL_PATH
-        self.settings.data["jwt_algorithm"] = self.jwt_algo_combo.get().strip() or "ES256"
+        self.settings.data["jwt_algorithm"] = self.jwt_algo_combo.get().strip() or "AUTO"
 
         for switch, key in [
             (self.paper_mode_switch, "paper_trading_enabled"),
