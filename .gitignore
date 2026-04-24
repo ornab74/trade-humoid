@@ -32,3 +32,4 @@ main_eth_perp_quantum_settings.json
 *.db
 *.db.aes
 coinbase_product_cache.sqlite3
+
