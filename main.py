@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -39,6 +40,11 @@ except Exception:
     jwt = None
 
 try:
+    import bleach
+except Exception:
+    bleach = None
+
+try:
     import psutil
 except Exception:
     psutil = None
@@ -61,8 +67,9 @@ except Exception as exc:
     raise RuntimeError("cryptography is required.") from exc
 
 
-APP_NAME = "Gemma4 ETH-PERP Entropic Quantum Intelligence"
+APP_NAME = "Entropic Coinbase Quantum Intelligence"
 SETTINGS_PATH = Path("main_eth_perp_quantum_settings.json")
+PRODUCT_CACHE_DB_PATH = Path("coinbase_product_cache.sqlite3")
 MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
 MODEL_FILE = "gemma-4-E2B-it.litertlm"
 EXPECTED_MODEL_SHA256 = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42"
@@ -72,6 +79,8 @@ DEFAULT_MODEL_PATH = str(MODELS_DIR / MODEL_FILE)
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 COINBASE_PUBLIC_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 COINBASE_AUTH_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}/candles"
+COINBASE_PUBLIC_PRODUCTS = "https://api.coinbase.com/api/v3/brokerage/market/products"
+COINBASE_AUTH_PRODUCTS_PATH = "/products"
 COINBASE_ADVANCED_BASE = "https://api.coinbase.com/api/v3/brokerage"
 COINBASE_INTX_CANDLES = "https://api.international.coinbase.com/api/v1/instruments/{instrument}/candles"
 NETWORK_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0)
@@ -81,6 +90,7 @@ PRIMARY_EMA_SPANS = (8, 13, 21, 34, 55, 89)
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_NATIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SAFE_PRODUCT_ID_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{1,80}$")
 ADVANCED_GRANULARITY_MAP = {
     1: "ONE_MINUTE",
     5: "FIVE_MINUTE",
@@ -102,6 +112,24 @@ INTX_GRANULARITY_MAP = {
     360: "SIX_HOUR",
     1440: "ONE_DAY",
 }
+
+TIMEFRAME_BUTTONS: Tuple[Tuple[str, int], ...] = (
+    ("1m", 1), ("5m", 5), ("15m", 15), ("30m", 30),
+    ("1h", 60), ("2h", 120), ("4h", 240), ("6h", 360),
+    ("12h", 720), ("1D", 1440), ("1W", 10080), ("1M", 43200),
+)
+SUPPORTED_TIMEFRAME_MINUTES = tuple(minutes for _, minutes in TIMEFRAME_BUTTONS)
+RESAMPLE_TIMEFRAME_MAP: Dict[int, Tuple[int, str, int]] = {
+    # Some Coinbase products expose sparse or inconsistent candles for non-core granularities.
+    # Build these from reliable smaller candles so chart buttons do not blank out.
+    30: (15, "30min", 2),
+    120: (60, "2h", 2),
+    240: (60, "4h", 4),
+    720: (360, "12h", 2),
+    10080: (1440, "W", 7),
+    43200: (1440, "ME", 31),
+}
+TIMEFRAME_LABEL_BY_MINUTE: Dict[int, str] = {minutes: label for label, minutes in TIMEFRAME_BUTTONS}
 LEGACY_SECRET_AAD = b"coinbase-secret-bundle-v4"
 VAULT_SECRET_AAD = b"coinbase-secret-bundle-v5"
 VAULT_MASTER_KEY_AAD = b"coinbase-secret-master-key-v2"
@@ -168,6 +196,8 @@ Primary lenses:
 - entropic drift and shock transition
 - RGB / Pennylane auxiliary sensor surface
 - retrieved analog memory states from this session only
+- product identity, contract expiry, and instrument eligibility
+- candle freshness, endpoint quality, and reference-market validity
 
 Hard rules:
 - Never promise profit.
@@ -177,6 +207,8 @@ Hard rules:
 - If the packet is contradictory, say exactly what is contradictory.
 - If the market is too entropic for monetization, say the regime should not be traded.
 - Treat maker and carry ideas as conditional research rails, not automatic trades.
+- For oil, commodity, or expiring futures products, verify contract identity, expiry, liquidity, and data quality before discussing direction.
+- If product identity, reference market, candle freshness, or liquidity quality is uncertain, downgrade confidence or return no-view.
 
 Required output:
 1. Thesis
@@ -253,6 +285,11 @@ Return the best stance and the strongest reason to stay flat.""",
         "Entropy Map": "Explain whether the regime is monetizable or too entropic.",
         "Long vs Short": "Give the strongest long and strongest short case side by side.",
         "Maker Rail": "Propose a selective maker rail only if passive quoting is defensible.",
+        "Futures Roll Map": "Map the contract expiry, basis, roll risk, liquidity state, and safest comparison market for the selected futures product.",
+        "Oil Futures Read": "Analyze the selected oil futures product using contract structure, volume/liquidity, trend, volatility, and invalidation-first risk framing.",
+        "Regime Classifier": "Classify the current market into one regime, explain why, list contradictions, and provide a no-trade trigger.",
+        "Data Quality Audit": "Audit the packet for stale candles, missing products, bad symbols, liquidity gaps, and source disagreements before producing any market view.",
+        "Decision Gate": "Return PASS, WATCH, or REJECT using evidence, contradictions, invalidations, liquidity, and execution risk.",
         "Stay Flat": "Make the best disciplined case for staying flat."
     },
     "prompt_library": {
@@ -366,6 +403,85 @@ Return the cleanest integrated read possible without exaggerating confidence."""
             "VISUAL_ENTROPY_DIAGNOSIS": """Use the image to decide whether the regime is visually orderly or visually entropic.""",
             "VISUAL_MEMORY_COMPARISON": """Compare the current chart image to the in-session memory narrative and say whether the image agrees."""
         },
+        "ADVANCED_FUTURES_AND_COMMODITY_PROMPTS": {
+            "CONTRACT_IDENTITY_RESOLVER": """First identify the selected product as spot, perpetual, expiring futures, or unsupported.
+Use product_id, display name, base asset, quote asset, expiry, contract size, price increment, and status when present.
+If fields are missing, say exactly what is missing and downgrade confidence before discussing direction.""",
+            "OIL_FUTURES_STRUCTURE_MEMO": """Analyze the selected oil futures contract as a derivatives instrument, not as spot oil.
+Separate: contract identity, expiry/roll context, session liquidity, candle quality, volatility regime, directional structure, and execution hazards.
+Never infer physical oil exposure unless the packet explicitly proves it.""",
+            "FUTURES_ROLL_AND_EXPIRY_RISK": """Explain how expiry proximity, roll behavior, and declining liquidity could distort the signal.
+State whether the selected contract is suitable for analysis, suitable only for observation, or too thin/stale to use.
+Include what continuous or reference market should be checked before acting.""",
+            "CROSS_ASSET_CONTEXT_CHECK": """Compare the selected product against its most relevant reference market when available.
+For crypto futures, compare against spot/perp reference.
+For oil futures, compare against the closest liquid oil reference if supplied; otherwise state that cross-asset confirmation is unavailable.
+Do not invent macro context from missing data.""",
+            "LIQUIDITY_AND_SLIPPAGE_FORENSICS": """Audit liquidity quality using volume, candle gaps, wick behavior, stale bars, and abrupt spread-like movement proxies.
+Decide whether market orders, maker orders, or no execution are most defensible.
+If liquidity is poor, make that the main conclusion.""",
+            "EXPIRING_CONTRACT_NO_TRADE_FILTER": """Build a hard no-trade filter for expiring contracts.
+Reject setups with stale candles, thin volume, large discontinuities, missing reference price, near-expiry distortion, or contradictory higher timeframe structure.
+Return only the conditions that would make the contract analyzable again."""
+        },
+        "ADVANCED_DECISION_ENGINE_PROMPTS": {
+            "EVIDENCE_WEIGHTED_DECISION_GATE": """Return exactly one of: PASS, WATCH, or REJECT.
+Base the decision on direct packet evidence only.
+Score trend, structure, flow, volatility, basis/reference agreement, liquidity quality, and data quality from -2 to +2.
+Then state the single strongest reason not to act.""",
+            "CONFIDENCE_CALIBRATION_ENGINE": """Calibrate confidence from evidence quality rather than signal strength.
+Penalize stale data, missing reference markets, single-timeframe agreement, high entropy, thin volume, and symbol ambiguity.
+Return confidence as LOW, MEDIUM, or HIGH with one sentence justifying the calibration.""",
+            "CONTRADICTION_PRIORITY_SORTER": """List contradictions in priority order.
+For each contradiction, say whether it is fatal, cautionary, or cosmetic.
+If any fatal contradiction exists, the final stance must be flat or reject.""",
+            "INVALIDATION_FIRST_THESIS": """Start with what would prove the thesis wrong.
+Only after invalidation is clear, describe the long case, short case, and flat case.
+Do not recommend action unless invalidation can be stated from observable market data.""",
+            "REGIME_STATE_CLASSIFIER": """Classify the current state as one of: TREND, RANGE, COMPRESSION, EXPANSION, REVERSAL_RISK, LIQUIDITY_SWEEP, STALE_OR_THIN, or UNUSABLE_DATA.
+Explain the classification using packet fields only, then state what regime transition would matter most next.""",
+            "MULTI_AGENT_MARKET_COUNCIL": """Run five internal reviewers and reveal only the consensus.
+Reviewer 1: trend follower. Reviewer 2: mean reversion trader. Reviewer 3: liquidity hunter. Reviewer 4: risk officer. Reviewer 5: data quality auditor.
+Consensus must include the best trade thesis and the best reason to do nothing."""
+        },
+        "ADVANCED_DATA_QUALITY_PROMPTS": {
+            "SYMBOL_AND_ENDPOINT_AUDIT": """Audit product_id, endpoint source, candle granularity, timestamp freshness, and returned row count.
+Flag symbol normalization issues, unsupported products, and endpoint mismatches.
+Do not analyze direction until the data source is judged usable.""",
+            "CANDLE_INTEGRITY_AUDIT": """Inspect the candle packet for missing rows, flatlined prices, impossible OHLC relationships, zero/negative volume, timestamp gaps, and outlier jumps.
+Return PASS, DEGRADED, or FAIL.
+If DEGRADED or FAIL, explain what analysis is still safe, if any.""",
+            "REFERENCE_MARKET_AUDIT": """Evaluate whether the reference product is appropriate.
+For a futures product, the reference must be economically related, liquid, and time-aligned.
+If no valid reference exists, disable basis claims and say so plainly.""",
+            "STALE_DATA_KILL_SWITCH": """Check whether the latest candle is stale relative to the selected timeframe.
+If stale, return a kill-switch warning before any market interpretation.
+Do not allow confident language when data is stale."""
+        },
+        "ADVANCED_RISK_AND_GOVERNANCE_PROMPTS": {
+            "AUTONOMY_PRE_FLIGHT_CHECK": """Before any autonomous or paper action, verify data quality, product validity, account mode, live_trading flag, confidence threshold, cooldown, notional size, leverage, and margin type.
+Return BLOCKED unless every condition is explicitly satisfied.""",
+            "ORDER_SAFETY_REVIEW": """Review the proposed order like a risk control system.
+Check product validity, side, size, leverage, margin mode, preview availability, liquidity suitability, and invalidation logic.
+Return APPROVE_PAPER_ONLY, REQUIRE_MANUAL_REVIEW, or BLOCK.""",
+            "LEVERAGE_FRAGILITY_AUDIT": """Explain how leverage changes the failure mode of the setup.
+Prefer smaller notional and lower leverage when volatility, entropy, liquidity risk, or symbol uncertainty rises.
+Never present leverage as improving edge.""",
+            "LOSS_BOUNDARY_DECLARATION": """State the loss boundary before any upside case.
+Include maximum acceptable thesis damage, market condition that invalidates the setup, and reason the system should stop re-entering after invalidation.""",
+            "FALSE_PRECISION_REMOVER": """Remove unjustified precision from the analysis.
+Replace exact claims that are not supported by the packet with ranges, conditional statements, or flat/no-view conclusions."""
+        },
+        "ADVANCED_OUTPUT_FORMATS": {
+            "COMPACT_OPERATOR_BRIEF": """Return a compact operator brief with these headings only:
+State, Data Quality, Regime, Dominant Risk, Long Trigger, Short Trigger, Flat Trigger, Kill Switch, Confidence.""",
+            "FULL_DERIVATIVES_MEMO": """Return a full derivatives memo with these headings:
+Product Identity, Data Quality, Market Structure, Cross-Market Context, Liquidity, Volatility, Long Case, Short Case, Flat Case, Execution Hazards, Invalidations, Confidence.""",
+            "JSON_DECISION_PACKET": """Return valid JSON only with keys: product_id, data_quality, regime, signal, confidence, long_case, short_case, flat_case, invalidations, kill_switches, action_gate.
+Do not include markdown around the JSON.""",
+            "RED_TEAM_REPORT": """Return only reasons the current thesis may be wrong.
+Group them into data problems, market structure problems, liquidity problems, execution problems, and model-overfit problems."""
+        },
         "CHAINED_MACROS": {
             "FULL_STACK_RESEARCH_CHAIN": """Use this sequence:
 1. MULTI_TIMEFRAME_DECISION_MEMO
@@ -424,6 +540,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "chart_show_ribbon_cloud": True,
     "chart_show_quantum_panel": True,
     "chart_show_ema233": True,
+    "side_tray_hidden": False,
     "rag_memory_enabled": True,
     "rag_memory_limit": 120,
     "pennylane_sensor_enabled": True,
@@ -513,6 +630,38 @@ def sanitize_structured_text(value: Any, *, max_chars: int = 20000) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip()
     return text
+
+
+def sanitize_ui_text(value: Any, *, max_chars: int = 240) -> str:
+    """Strip control chars and markup before a value is displayed in the UI."""
+    text = sanitize_structured_text(value, max_chars=max_chars)
+    if bleach is not None:
+        text = bleach.clean(text, tags=[], attributes={}, strip=True)
+    return text.strip()[:max_chars]
+
+
+def sanitize_product_id(value: Any, *, default: str = "ETH-USD") -> str:
+    """Coinbase product ids are safe ASCII symbols. Reject/normalize everything else."""
+    text = sanitize_ui_text(value, max_chars=96).upper().replace("/", "-").replace(" ", "-")
+    text = re.sub(r"[^A-Z0-9._-]", "", text).strip(".-_")
+    text = re.sub(r"^(N[A-Z]{1,3}-\d{1,2}[A-Z]{3}\d{2}-CDE)(?:ETH|BTC|USD|USDC)$", r"\1", text)
+    return text if SAFE_PRODUCT_ID_RE.match(text) else default
+
+
+def safe_product_label(product: Dict[str, Any]) -> str:
+    pid = sanitize_product_id(product.get("product_id"), default="ETH-USD")
+    display = sanitize_ui_text(
+        product.get("display_name_overwrite")
+        or product.get("display_name")
+        or product.get("future_product_details", {}).get("display_name")
+        or product.get("alias")
+        or pid,
+        max_chars=96,
+    )
+    ptype = sanitize_ui_text(product.get("product_type") or "", max_chars=24)
+    venue = sanitize_ui_text(product.get("product_venue") or product.get("future_product_details", {}).get("venue") or "", max_chars=32)
+    suffix = " · ".join(part for part in (ptype, venue) if part)
+    return f"{pid} — {display}" + (f" ({suffix})" if suffix else "")
 
 
 def resolve_native_image_path(image_path: Optional[str | Path]) -> Optional[Path]:
@@ -851,19 +1000,96 @@ class PromptPackManager:
         self.settings.save()
 
 
+class EncryptedProductStore:
+    """SQLite cache with per-row AES-GCM encrypted product payloads."""
+
+    def __init__(self, path: Path = PRODUCT_CACHE_DB_PATH):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS products (
+                    product_id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    product_type TEXT NOT NULL DEFAULT '',
+                    venue TEXT NOT NULL DEFAULT '',
+                    fetched_at TEXT NOT NULL,
+                    nonce_b64 TEXT NOT NULL,
+                    ciphertext_b64 TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_label ON products(label)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_type ON products(product_type)")
+
+    @staticmethod
+    def _cache_key(master_key: bytes) -> bytes:
+        return hashlib.sha256(b"coinbase-product-cache-v1" + bytes(master_key)).digest()
+
+    def save_products(self, products: List[Dict[str, Any]], master_key: bytes) -> None:
+        if not master_key:
+            return
+        aes = AESGCM(self._cache_key(master_key))
+        now = utc_now_iso()
+        rows = []
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            pid = sanitize_product_id(product.get("product_id"), default="")
+            if not pid:
+                continue
+            label = safe_product_label(product)
+            ptype = sanitize_ui_text(product.get("product_type") or "", max_chars=24)
+            venue = sanitize_ui_text(product.get("product_venue") or product.get("future_product_details", {}).get("venue") or "", max_chars=32)
+            nonce = os.urandom(12)
+            plaintext = json.dumps(product, separators=(",", ":"), default=str).encode("utf-8")
+            ciphertext = aes.encrypt(nonce, plaintext, pid.encode("utf-8"))
+            rows.append((pid, label, ptype, venue, now, base64.b64encode(nonce).decode("utf-8"), base64.b64encode(ciphertext).decode("utf-8")))
+        if not rows:
+            return
+        with sqlite3.connect(self.path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO products(product_id, label, product_type, venue, fetched_at, nonce_b64, ciphertext_b64)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(product_id) DO UPDATE SET
+                    label=excluded.label, product_type=excluded.product_type, venue=excluded.venue,
+                    fetched_at=excluded.fetched_at, nonce_b64=excluded.nonce_b64, ciphertext_b64=excluded.ciphertext_b64
+                """,
+                rows,
+            )
+
+    def load_index(self) -> List[Dict[str, str]]:
+        with sqlite3.connect(self.path) as conn:
+            rows = conn.execute(
+                "SELECT product_id, label, product_type, venue, fetched_at FROM products ORDER BY product_type DESC, product_id ASC"
+            ).fetchall()
+        return [
+            {"product_id": row[0], "label": row[1], "product_type": row[2], "venue": row[3], "fetched_at": row[4]}
+            for row in rows
+        ]
+
+
 class CoinbaseAdvancedClient:
     def __init__(self, settings: SettingsManager):
         self.settings = settings
         self.http = httpx.Client(timeout=NETWORK_TIMEOUT)
         self.secrets: Dict[str, Any] = {}
         self.last_public_error = ""
+        self.product_metadata_by_id: Dict[str, Dict[str, Any]] = {}
+        self._auth_disabled_error = ""
 
     def set_secrets(self, secrets: Dict[str, Any]) -> None:
         self.secrets = secrets or {}
+        self._auth_disabled_error = ""
 
     @staticmethod
     def _candidate_product_ids(product_id: str) -> List[str]:
-        base = (product_id or "").strip().upper()
+        base = sanitize_product_id(product_id, default="")
         if not base:
             return []
         candidates = [base]
@@ -871,15 +1097,34 @@ class CoinbaseAdvancedClient:
             candidates.append(f"{base}-INTX")
         if base.endswith("-PERP-INTX"):
             candidates.append(base.removesuffix("-INTX"))
+        if base.endswith("-USDC"):
+            # Coinbase Advanced Trade docs note many -USDC products share market data with the -USD product.
+            candidates.append(base.removesuffix("-USDC") + "-USD")
+        if base.endswith("-USD"):
+            candidates.append(base.removesuffix("-USD") + "-USDC")
         seen: List[str] = []
         for candidate in candidates:
+            candidate = sanitize_product_id(candidate, default="")
             if candidate and candidate not in seen:
                 seen.append(candidate)
         return seen
 
+    def _product_meta(self, product_id: str) -> Dict[str, Any]:
+        clean = sanitize_product_id(product_id, default="")
+        return self.product_metadata_by_id.get(clean, {}) if clean else {}
+
+    def _is_futures_product(self, product_id: str) -> bool:
+        clean = sanitize_product_id(product_id, default="")
+        meta = self._product_meta(clean)
+        if str(meta.get("product_type") or "").upper() == "FUTURE":
+            return True
+        if isinstance(meta.get("future_product_details"), dict) and meta.get("future_product_details"):
+            return True
+        return bool(re.match(r"^[A-Z]{2,4}-\d{1,2}[A-Z]{3}\d{2}-CDE$", clean))
+
     @staticmethod
     def _intx_candidates(product_id: str) -> List[str]:
-        base = (product_id or "").strip().upper()
+        base = sanitize_product_id(product_id, default="")
         if not base or "-PERP" not in base:
             return []
         candidates = [base.removesuffix("-INTX"), base]
@@ -901,6 +1146,11 @@ class CoinbaseAdvancedClient:
             if len(body) > 240:
                 body = f"{body[:237]}..."
             detail = f"{response.status_code} {response.reason_phrase} for {response.request.url}"
+            if response.status_code == 401 and ("unrecognized" in body.lower() or "api key" in body.lower()):
+                return (
+                    f"{detail} :: Coinbase rejected the API key name. Use the CDP JSON field named 'name' "
+                    "(usually organizations/{org}/apiKeys/{key}) with the matching privateKey, not only the short key id or secret."
+                )
             return f"{detail} :: {body}" if body else detail
         return str(exc)
 
@@ -941,8 +1191,34 @@ class CoinbaseAdvancedClient:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df[["Open", "High", "Low", "Close", "Volume"]].dropna(how="any").tail(bars)
 
+    @staticmethod
+    def _resample_candles(df: pd.DataFrame, rule: str, bars: int) -> pd.DataFrame:
+        if df.empty:
+            return df
+        try:
+            resampled = df.resample(rule).agg(
+                {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+            )
+            return resampled.dropna(how="any").tail(max(1, int(bars)))
+        except Exception:
+            return pd.DataFrame()
+
     def public_candles(self, product_id: str, minutes: int, bars: int) -> pd.DataFrame:
         requested_minutes = max(1, int(minutes))
+        if requested_minutes in RESAMPLE_TIMEFRAME_MAP:
+            base_minutes, rule, multiplier = RESAMPLE_TIMEFRAME_MAP[requested_minutes]
+            base_bars = min(350, max(25, int(bars) * int(multiplier)))
+            base_df = self.public_candles(product_id, base_minutes, base_bars)
+            base_error = self.last_public_error
+            out = self._resample_candles(base_df, rule, bars)
+            if not out.empty:
+                self.last_public_error = ""
+                return out
+            if base_df.empty:
+                self.last_public_error = f"Could not build {requested_minutes}m candles for {product_id}: base {base_minutes}m candles failed. {base_error}".strip()
+            else:
+                self.last_public_error = f"Could not locally resample {base_minutes}m candles into {requested_minutes}m candles for {product_id}."
+            return pd.DataFrame()
         advanced_granularity = ADVANCED_GRANULARITY_MAP.get(requested_minutes)
         intx_granularity = INTX_GRANULARITY_MAP.get(requested_minutes)
         granularity = max(60, requested_minutes * 60)
@@ -954,10 +1230,12 @@ class CoinbaseAdvancedClient:
         advanced_start_ts = end_ts - granularity * advanced_limit
         exchange_start_ts = end_ts - granularity * exchange_limit
         errors: List[str] = []
-        candidates = self._candidate_product_ids(product_id)
+        requested_product = sanitize_product_id(product_id, default="")
+        candidates = self._candidate_product_ids(requested_product)
+        is_futures = self._is_futures_product(requested_product)
 
-        if intx_granularity and "-PERP" in (product_id or "").strip().upper():
-            for candidate in self._intx_candidates(product_id):
+        if intx_granularity and "-PERP" in requested_product:
+            for candidate in self._intx_candidates(requested_product):
                 try:
                     r = self.http.get(
                         COINBASE_INTX_CANDLES.format(instrument=candidate),
@@ -979,7 +1257,7 @@ class CoinbaseAdvancedClient:
 
         if advanced_granularity:
             for candidate in candidates:
-                if self.secrets:
+                if self.secrets and jwt is not None and not self._auth_disabled_error:
                     try:
                         path = f"/products/{candidate}/candles"
                         token = self._jwt_token("GET", path)
@@ -1000,7 +1278,16 @@ class CoinbaseAdvancedClient:
                             return df
                         errors.append(f"advanced auth candles returned 0 rows for {candidate}")
                     except Exception as exc:
-                        errors.append(f"advanced auth candles failed for {candidate}: {self._format_request_error(exc)}")
+                        msg = self._format_request_error(exc)
+                        if self._looks_like_private_key_error(exc):
+                            self._auth_disabled_error = self._friendly_private_key_error()
+                            errors.append(f"advanced auth candles skipped: {self._auth_disabled_error}")
+                        else:
+                            errors.append(f"advanced auth candles failed for {candidate}: {msg}")
+                elif self.secrets and self._auth_disabled_error:
+                    errors.append(f"advanced auth candles skipped: {self._auth_disabled_error}")
+                elif self.secrets and jwt is None:
+                    errors.append("advanced auth candles skipped: PyJWT is not installed. Run: pip install PyJWT")
 
                 try:
                     r = self.http.get(
@@ -1022,46 +1309,158 @@ class CoinbaseAdvancedClient:
                 except Exception as exc:
                     errors.append(f"advanced public candles failed for {candidate}: {self._format_request_error(exc)}")
 
-        for candidate in candidates:
-            try:
-                r = self.http.get(
-                    COINBASE_EXCHANGE_CANDLES.format(product_id=candidate),
-                    params={"granularity": granularity, "start": exchange_start_ts, "end": end_ts},
-                    headers={"Cache-Control": "no-cache"},
-                )
-                r.raise_for_status()
-                df = self._candles_to_frame(r.json(), source="exchange", bars=bars)
-                if not df.empty:
-                    self.last_public_error = ""
-                    return df
-                errors.append(f"exchange candles returned 0 rows for {candidate}")
-            except Exception as exc:
-                errors.append(f"exchange candles failed for {candidate}: {self._format_request_error(exc)}")
+        # Coinbase Exchange API does not know Advanced Trade CFM futures symbols, so skip that noisy 404 path.
+        # For USDC-quoted products, still allow the USD market-data candidate through Exchange
+        # (example: ARB-USDC -> ARB-USD), but do not hit Exchange with the USDC candidate itself.
+        if not is_futures:
+            for candidate in candidates:
+                if candidate.endswith("-USDC"):
+                    errors.append(f"exchange candles skipped for {candidate}: trying USD market-data candidates instead")
+                    continue
+                try:
+                    r = self.http.get(
+                        COINBASE_EXCHANGE_CANDLES.format(product_id=candidate),
+                        params={"granularity": granularity, "start": exchange_start_ts, "end": end_ts},
+                        headers={"Cache-Control": "no-cache"},
+                    )
+                    r.raise_for_status()
+                    df = self._candles_to_frame(r.json(), source="exchange", bars=bars)
+                    if not df.empty:
+                        self.last_public_error = ""
+                        return df
+                    errors.append(f"exchange candles returned 0 rows for {candidate}")
+                except Exception as exc:
+                    errors.append(f"exchange candles failed for {candidate}: {self._format_request_error(exc)}")
 
-            try:
-                r = self.http.get(
-                    COINBASE_EXCHANGE_CANDLES.format(product_id=candidate),
-                    params={"granularity": granularity},
-                    headers={"Cache-Control": "no-cache"},
-                )
-                r.raise_for_status()
-                df = self._candles_to_frame(r.json(), source="exchange", bars=bars)
-                if not df.empty:
-                    self.last_public_error = ""
-                    return df
-                errors.append(f"exchange latest candles returned 0 rows for {candidate}")
-            except Exception as exc:
-                errors.append(f"exchange latest candles failed for {candidate}: {self._format_request_error(exc)}")
+                try:
+                    r = self.http.get(
+                        COINBASE_EXCHANGE_CANDLES.format(product_id=candidate),
+                        params={"granularity": granularity},
+                        headers={"Cache-Control": "no-cache"},
+                    )
+                    r.raise_for_status()
+                    df = self._candles_to_frame(r.json(), source="exchange", bars=bars)
+                    if not df.empty:
+                        self.last_public_error = ""
+                        return df
+                    errors.append(f"exchange latest candles returned 0 rows for {candidate}")
+                except Exception as exc:
+                    errors.append(f"exchange latest candles failed for {candidate}: {self._format_request_error(exc)}")
+        else:
+            errors.append(f"exchange candles skipped for {requested_product}: CFM/Advanced futures are not Coinbase Exchange products")
 
-        self.last_public_error = "; ".join(errors) if errors else f"no candle data returned for {product_id}"
+        # Keep the UI readable: de-duplicate, cap repeated PyJWT warnings, and avoid multi-screen exception spam.
+        compact_errors: List[str] = []
+        for err in errors:
+            if err not in compact_errors:
+                compact_errors.append(err)
+        if is_futures and jwt is None and self.secrets:
+            compact_errors.insert(0, "Install PyJWT to use authenticated Coinbase futures candles: pip install PyJWT")
+        self.last_public_error = "; ".join(compact_errors[:5]) if compact_errors else f"no candle data returned for {requested_product}"
         return pd.DataFrame()
+
+    @staticmethod
+    def _json_obj_from_text(value: Any) -> Dict[str, Any]:
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            loaded = json.loads(text)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _extract_api_key_name(value: Any) -> str:
+        """Return the exact CDP API key name expected in JWT iss/sub/kid."""
+        text = sanitize_structured_text(value or "", max_chars=20000).strip()
+        obj = CoinbaseAdvancedClient._json_obj_from_text(text)
+        if obj:
+            for key in ("name", "apiKeyName", "api_key_name", "keyName", "key_name"):
+                candidate = sanitize_structured_text(obj.get(key) or "", max_chars=5000).strip()
+                if candidate:
+                    return candidate
+            # Last resort only: older exports/tools may call it id. Coinbase usually wants full 'name'.
+            candidate = sanitize_structured_text(obj.get("id") or obj.get("keyId") or obj.get("key_id") or "", max_chars=5000).strip()
+            if candidate:
+                return candidate
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1].strip()
+        return text
+
+    @staticmethod
+    def _normalize_private_key_input(value: Any) -> str:
+        text = str(value or "").strip()
+        obj = CoinbaseAdvancedClient._json_obj_from_text(text)
+        if obj:
+            for key in ("privateKey", "private_key", "pem", "secret"):
+                candidate = obj.get(key)
+                if candidate:
+                    text = str(candidate).strip()
+                    break
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1].strip()
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+        text = CONTROL_CHARS_RE.sub(" ", text).strip()
+        for marker in ("EC PRIVATE KEY", "PRIVATE KEY"):
+            begin = f"-----BEGIN {marker}-----"
+            end = f"-----END {marker}-----"
+            if begin in text and end in text:
+                body = text.split(begin, 1)[1].split(end, 1)[0]
+                compact_body = re.sub(r"\s+", "", body)
+                if compact_body:
+                    wrapped_body = "\n".join(compact_body[i : i + 64] for i in range(0, len(compact_body), 64))
+                    return f"{begin}\n{wrapped_body}\n{end}\n"
+        return text
+
+    @staticmethod
+    def extract_coinbase_credentials(api_key_input: Any, private_key_input: Any) -> Tuple[str, str, List[str]]:
+        """Accept separate fields or a pasted CDP JSON key and return (api_key_name, private_key_pem, notes)."""
+        notes: List[str] = []
+        api_text = str(api_key_input or "").strip()
+        key_text = str(private_key_input or "").strip()
+        api_obj = CoinbaseAdvancedClient._json_obj_from_text(api_text)
+        key_obj = CoinbaseAdvancedClient._json_obj_from_text(key_text)
+        combined = api_obj or key_obj
+        api_key = CoinbaseAdvancedClient._extract_api_key_name(api_text)
+        private_key = CoinbaseAdvancedClient._normalize_private_key_input(key_text)
+        if combined:
+            from_json_api = CoinbaseAdvancedClient._extract_api_key_name(json.dumps(combined))
+            from_json_key = CoinbaseAdvancedClient._normalize_private_key_input(json.dumps(combined))
+            if from_json_api and (not api_key or api_obj):
+                api_key = from_json_api
+            if from_json_key and (not private_key or key_obj):
+                private_key = from_json_key
+            notes.append("Detected Coinbase CDP JSON key export and extracted name/privateKey fields.")
+        if api_key and not api_key.startswith("organizations/"):
+            notes.append("API key does not look like the full CDP name organizations/{org}/apiKeys/{key}; Coinbase may return 401 key unrecognized.")
+        return api_key.strip(), private_key.strip(), notes
+
+    @staticmethod
+    def _looks_like_private_key_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "could not deserialize key data" in msg
+            or "unsupported key type" in msg
+            or ("unsupported" in msg and "openssl" in msg)
+            or "invalid key" in msg
+        )
+
+    @staticmethod
+    def _friendly_private_key_error() -> str:
+        return (
+            "Coinbase private key format is invalid. Re-save the full CDP API private key PEM, "
+            "including BEGIN/END lines, or paste the JSON key's privateKey value; do not paste an API secret/password."
+        )
 
     def _jwt_token(self, method: str, path: str) -> str:
         if jwt is None:
             raise RuntimeError("PyJWT is required.")
-        api_key = (self.secrets.get("coinbase_api_key") or "").strip()
-        private_key = (self.secrets.get("coinbase_private_key") or "").strip()
-        algorithm = self.settings.data.get("jwt_algorithm", "ES256")
+        api_key, private_key, _ = self.extract_coinbase_credentials(
+            self.secrets.get("coinbase_api_key") or "",
+            self.secrets.get("coinbase_private_key") or "",
+        )
+        algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "ES256"), max_chars=24).strip() or "ES256"
         if not api_key or not private_key:
             raise RuntimeError("Coinbase credentials are required.")
         now = int(time.time())
@@ -1074,7 +1473,12 @@ class CoinbaseAdvancedClient:
             "aud": "retail_rest_api",
             "uris": [f"{method.upper()} api.coinbase.com{path}"],
         }
-        token = jwt.encode(payload, private_key, algorithm=algorithm, headers={"kid": api_key})
+        try:
+            token = jwt.encode(payload, private_key, algorithm=algorithm, headers={"kid": api_key})
+        except Exception as exc:
+            if self._looks_like_private_key_error(exc):
+                raise RuntimeError(self._friendly_private_key_error()) from exc
+            raise
         return token if isinstance(token, str) else token.decode("utf-8")
 
     def _private_request(self, method: str, path: str, json_body: Optional[dict] = None) -> dict:
@@ -1087,6 +1491,81 @@ class CoinbaseAdvancedClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def list_products(self, *, master_key: Optional[bytes] = None, cache: Optional[EncryptedProductStore] = None) -> List[Dict[str, Any]]:
+        """Load Coinbase products, including expiring CFM futures such as NOL-18MAY26-CDE."""
+        products_by_id: Dict[str, Dict[str, Any]] = {}
+        errors: List[str] = []
+
+        def add_many(items: Any) -> None:
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                pid = sanitize_product_id(item.get("product_id"), default="")
+                if pid:
+                    item["product_id"] = pid
+                    products_by_id[pid] = item
+
+        if self.secrets:
+            auth_queries = [
+                {"limit": 250, "get_all_products": "true"},
+                {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "EXPIRING", "expiring_contract_status": "STATUS_UNEXPIRED"},
+                {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"},
+                {"limit": 250, "product_type": "FUTURE", "futures_underlying_type": "FUTURES_UNDERLYING_TYPE_COMMOD"},
+            ]
+            for params in auth_queries:
+                cursor = None
+                while True:
+                    request_params = dict(params)
+                    if cursor:
+                        request_params["cursor"] = cursor
+                    try:
+                        token = self._jwt_token("GET", COINBASE_AUTH_PRODUCTS_PATH)
+                        r = self.http.get(
+                            f"{COINBASE_ADVANCED_BASE}{COINBASE_AUTH_PRODUCTS_PATH}",
+                            params=request_params,
+                            headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"},
+                        )
+                        r.raise_for_status()
+                        payload = r.json()
+                        add_many(payload.get("products", []))
+                        pagination = payload.get("pagination") or {}
+                        cursor = pagination.get("next_cursor") if pagination.get("has_next") else None
+                        if not cursor:
+                            break
+                    except Exception as exc:
+                        errors.append(f"auth products failed for {request_params}: {self._format_request_error(exc)}")
+                        break
+
+        try:
+            r = self.http.get(COINBASE_PUBLIC_PRODUCTS, params={"limit": 250}, headers={"Cache-Control": "no-cache"})
+            r.raise_for_status()
+            add_many(r.json().get("products", []))
+        except Exception as exc:
+            errors.append(f"public products failed: {self._format_request_error(exc)}")
+
+        if "NOL-18MAY26-CDE" not in products_by_id:
+            products_by_id["NOL-18MAY26-CDE"] = {
+                "product_id": "NOL-18MAY26-CDE",
+                "display_name": "nano Crude Oil Futures 18 MAY 26",
+                "product_type": "FUTURE",
+                "product_venue": "CFM",
+                "future_product_details": {
+                    "contract_code": "NOL",
+                    "contract_expiry_name": "18 MAY 26",
+                    "futures_asset_type": "FUTURES_ASSET_TYPE_COMMOD",
+                    "non_crypto": True,
+                },
+            }
+
+        products = sorted(products_by_id.values(), key=lambda p: (str(p.get("product_type") or ""), str(p.get("product_id") or "")))
+        self.product_metadata_by_id = {sanitize_product_id(p.get("product_id"), default=""): p for p in products if sanitize_product_id(p.get("product_id"), default="")}
+        if products and cache is not None and master_key:
+            cache.save_products(products, master_key)
+        self.last_public_error = "; ".join(errors[:4]) if errors and not products else ""
+        return products
 
     def preview_market_order(self, side: str, quote_size: str, product_id: str, leverage: Optional[str], margin_type: Optional[str]) -> dict:
         payload = {
@@ -1448,13 +1927,16 @@ class AdvancedAlphaEngine:
         packets = [self._packet(m, df) for m, df in sorted(frames.items()) if not df.empty]
         if not packets:
             raise RuntimeError("No market frames.")
-        primary_target = min(frames.keys(), key=lambda x: abs(x - 15))
-        primary = next(p for p in packets if p.minutes == primary_target)
-        lower = min(packets, key=lambda p: p.minutes)
-        higher = max(packets, key=lambda p: p.minutes)
+        sorted_packets = sorted(packets, key=lambda p: p.minutes)
+        primary = sorted_packets[len(sorted_packets) // 2]
+        lower = sorted_packets[0]
+        higher = sorted_packets[-1]
 
         perp = frames[primary.minutes]["Close"]
-        spot = reference_frames[primary.minutes]["Close"]
+        reference_primary = reference_frames.get(primary.minutes)
+        if reference_primary is None or reference_primary.empty:
+            reference_primary = frames[primary.minutes]
+        spot = reference_primary["Close"]
         joined = pd.concat([perp.rename("perp"), spot.rename("spot")], axis=1, join="inner").dropna()
         basis_pct = safe_float(((joined.iloc[-1]["perp"] - joined.iloc[-1]["spot"]) / joined.iloc[-1]["spot"])) if not joined.empty else 0.0
         recent_basis = ((joined["perp"] - joined["spot"]) / joined["spot"]).dropna() if not joined.empty else pd.Series(dtype=float)
@@ -1976,8 +2458,12 @@ class PromptArchitect:
 
 
 class DerivativesChartPanel(ctk.CTkFrame):
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, timeframe_callback: Optional[Any] = None, fullscreen_callback: Optional[Any] = None, product_callback: Optional[Any] = None, vault_callback: Optional[Any] = None, **kwargs):
         super().__init__(master, fg_color=THEME["panel"], corner_radius=18, **kwargs)
+        self.timeframe_callback = timeframe_callback
+        self.fullscreen_callback = fullscreen_callback
+        self.product_callback = product_callback
+        self.vault_callback = vault_callback
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
         self.df = pd.DataFrame()
@@ -1997,12 +2483,13 @@ class DerivativesChartPanel(ctk.CTkFrame):
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
         header.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
+        self.header_title = ctk.CTkLabel(
             header,
-            text="ETH-PERP Native Surface",
+            text="Market Native Surface",
             text_color=THEME["text"],
             font=ctk.CTkFont(size=20, weight="bold"),
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self.header_title.grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
             text="In-house canvas renderer · mouse wheel zoom · drag to pan · hover crosshair · TradingView-inspired layout",
@@ -2013,10 +2500,61 @@ class DerivativesChartPanel(ctk.CTkFrame):
         controls = ctk.CTkFrame(header, fg_color="transparent")
         controls.grid(row=0, column=1, rowspan=2, sticky="e")
         self.viewport_label = ctk.CTkLabel(controls, text="140 bars", text_color=THEME["muted"], font=ctk.CTkFont(size=11))
-        self.viewport_label.grid(row=0, column=0, columnspan=3, sticky="e", pady=(0, 4))
+        self.viewport_label.grid(row=0, column=0, columnspan=8, sticky="e", pady=(0, 4))
         ctk.CTkButton(controls, text="Zoom -", width=74, command=self.zoom_out, fg_color=THEME["card_soft"]).grid(row=1, column=0, padx=(0, 4))
         ctk.CTkButton(controls, text="Zoom +", width=74, command=self.zoom_in, fg_color=THEME["accent_2"], text_color="#08131f").grid(row=1, column=1, padx=4)
-        ctk.CTkButton(controls, text="Reset", width=74, command=self.reset_view, fg_color=THEME["accent"], text_color="#121212").grid(row=1, column=2, padx=(4, 0))
+        ctk.CTkButton(controls, text="Reset", width=74, command=self.reset_view, fg_color=THEME["accent"], text_color="#121212").grid(row=1, column=2, padx=4)
+        self.market_button = ctk.CTkButton(
+            controls,
+            text="Market",
+            width=102,
+            command=self._request_product_picker,
+            fg_color=THEME["accent_3"],
+            hover_color=THEME["line"],
+            text_color="#08131f",
+        )
+        self.market_button.grid(row=1, column=3, padx=4)
+        self.vault_button = ctk.CTkButton(
+            controls,
+            text="Unlock Vault",
+            width=104,
+            command=self._request_vault_unlock,
+            fg_color=THEME["warning"],
+            hover_color=THEME["line"],
+            text_color="#121212",
+        )
+        self.vault_button.grid(row=1, column=4, padx=4)
+        self.side_tray_button = ctk.CTkButton(
+            controls,
+            text="Hide Tray",
+            width=88,
+            command=self._request_side_tray_toggle,
+            fg_color=THEME["card_soft"],
+            hover_color=THEME["line"],
+            text_color=THEME["text"],
+        )
+        self.side_tray_button.grid(row=1, column=5, padx=4)
+        self.fullscreen_button = ctk.CTkButton(
+            controls,
+            text="Fullscreen",
+            width=96,
+            command=self._request_fullscreen_toggle,
+            fg_color=THEME["card_soft"],
+            hover_color=THEME["line"],
+            text_color=THEME["text"],
+        )
+        self.fullscreen_button.grid(row=1, column=6, padx=(4, 0))
+        timeframe_row = ctk.CTkFrame(controls, fg_color="transparent")
+        timeframe_row.grid(row=2, column=0, columnspan=8, sticky="e", pady=(6, 0))
+        self.timeframe_buttons: Dict[int, Any] = {}
+        for idx, (label, minutes) in enumerate(TIMEFRAME_BUTTONS):
+            btn = ctk.CTkButton(
+                timeframe_row, text=label, width=42, height=26, fg_color=THEME["card_soft"],
+                hover_color=THEME["line"], text_color=THEME["text"],
+                command=lambda m=minutes: self.set_timeframe(m),
+            )
+            btn.grid(row=idx // 6, column=idx % 6, padx=2, pady=2)
+            self.timeframe_buttons[minutes] = btn
 
         self.canvas = tk.Canvas(self, bg=THEME["panel"], highlightthickness=0, bd=0, relief="flat", cursor="crosshair")
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 12))
@@ -2029,6 +2567,71 @@ class DerivativesChartPanel(ctk.CTkFrame):
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+
+    def _request_product_picker(self) -> None:
+        if callable(self.product_callback):
+            try:
+                self.product_callback()
+            except Exception:
+                pass
+
+    def _request_vault_unlock(self) -> None:
+        if callable(getattr(self, "vault_callback", None)):
+            try:
+                self.vault_callback()
+            except Exception:
+                pass
+
+    def set_vault_state(self, unlocked: bool, has_vault: bool = True) -> None:
+        try:
+            if unlocked:
+                self.vault_button.configure(text="Vault Unlocked", fg_color=THEME["success"], text_color="#08131f")
+            elif has_vault:
+                self.vault_button.configure(text="Unlock Vault", fg_color=THEME["warning"], text_color="#121212")
+            else:
+                self.vault_button.configure(text="No Vault", fg_color=THEME["card_soft"], text_color=THEME["muted"])
+        except Exception:
+            pass
+
+    def set_market_label(self, product_id: str, reference_id: str = "") -> None:
+        try:
+            product = sanitize_product_id(product_id, default="ETH-PERP")
+            label = product if not reference_id else f"{product} · Ref {sanitize_product_id(reference_id, default=reference_id)}"
+            self.market_button.configure(text=label[:26])
+        except Exception:
+            pass
+
+    def _request_side_tray_toggle(self) -> None:
+        root = self.winfo_toplevel()
+        callback = getattr(root, "toggle_side_tray", None)
+        if callable(callback):
+            callback()
+
+    def set_side_tray_state(self, hidden: bool) -> None:
+        try:
+            self.side_tray_button.configure(
+                text="Show Tray" if hidden else "Hide Tray",
+                fg_color=THEME["accent_3"] if hidden else THEME["card_soft"],
+                text_color="#08131f" if hidden else THEME["text"],
+            )
+        except Exception:
+            pass
+        self._draw()
+
+    def _request_fullscreen_toggle(self) -> None:
+        if callable(self.fullscreen_callback):
+            self.fullscreen_callback()
+
+    def set_fullscreen_state(self, active: bool) -> None:
+        try:
+            self.fullscreen_button.configure(
+                text="Exit Fullscreen" if active else "Fullscreen",
+                fg_color=THEME["accent"] if active else THEME["card_soft"],
+                text_color="#121212" if active else THEME["text"],
+            )
+        except Exception:
+            pass
+        self._draw()
 
     @staticmethod
     def _crisp(value: float) -> float:
@@ -2047,6 +2650,26 @@ class DerivativesChartPanel(ctk.CTkFrame):
         if not lows:
             return 0.0, 1.0
         return min(lows), max(highs)
+
+    def set_timeframe(self, minutes: int) -> None:
+        minutes = max(1, int(minutes))
+        self.set_active_timeframe(minutes)
+        if self.timeframe_callback is not None:
+            try:
+                self.timeframe_callback(minutes)
+            except Exception:
+                pass
+
+    def set_active_timeframe(self, minutes: int) -> None:
+        active = max(1, int(minutes))
+        for tf_minutes, button in getattr(self, "timeframe_buttons", {}).items():
+            try:
+                if int(tf_minutes) == active:
+                    button.configure(fg_color=THEME["accent"], text_color="#121212")
+                else:
+                    button.configure(fg_color=THEME["card_soft"], text_color=THEME["text"])
+            except Exception:
+                pass
 
     @staticmethod
     def _map_y(value: float, rect: Tuple[float, float, float, float], low: float, high: float) -> float:
@@ -2386,6 +3009,13 @@ class DerivativesChartPanel(ctk.CTkFrame):
         self.reference_df = reference_df.copy()
         self.surface = surface
         self.settings = dict(settings)
+        try:
+            product_id = sanitize_product_id(self.settings.get("product_id"), default="ETH-PERP")
+            reference_id = sanitize_product_id(self.settings.get("reference_product_id"), default="ETH-USD")
+            self.header_title.configure(text=f"{product_id} Native Surface · Ref {reference_id}")
+            self.set_market_label(product_id, reference_id)
+        except Exception:
+            pass
         if self.df.empty:
             self.hover_index = None
             self.right_offset = 0
@@ -2614,7 +3244,8 @@ class StatusTile(ctk.CTkFrame):
     def __init__(self, master, title: str):
         super().__init__(master, fg_color=THEME["card"], corner_radius=16)
         self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=title, text_color=THEME["muted"], font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        self.title_label = ctk.CTkLabel(self, text=title, text_color=THEME["muted"], font=ctk.CTkFont(size=11, weight="bold"))
+        self.title_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
         self.value = ctk.CTkLabel(self, text="—", text_color=THEME["text"], font=ctk.CTkFont(size=18, weight="bold"))
         self.value.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
 
@@ -2767,10 +3398,10 @@ class StartupSetupDialog(ctk.CTkToplevel):
         card.pack(fill="both", expand=True, padx=18, pady=18)
         card.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(card, text="First Start Workflow", text_color=THEME["text"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
+        ctk.CTkLabel(card, text="Setup / Vault Workflow", text_color=THEME["text"], font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
         ctk.CTkLabel(
             card,
-            text="This startup guide appears automatically only once. Use Setup to seal the vault, add Coinbase credentials, choose products, and download the Gemma runtime.",
+            text="This setup guide only opens automatically for a brand-new profile. Use Setup to seal the vault, add Coinbase credentials, choose products, and download the Gemma runtime.",
             text_color=THEME["muted"],
             justify="left",
             wraplength=560,
@@ -2799,6 +3430,219 @@ class StartupSetupDialog(ctk.CTkToplevel):
         return self.result
 
 
+
+class ProductPickerDialog(ctk.CTkToplevel):
+    """Scrollable, searchable product selector for large Coinbase product lists.
+
+    The picker keeps the search field stable while filtering. It does not pre-fill
+    the search box with the current product, debounces filtering, preserves focus,
+    and renders only a small page at a time so very large product lists remain
+    responsive.
+    """
+
+    def __init__(self, master, *, title: str, labels: List[str], current: str = ""):
+        super().__init__(master)
+        self.result: Optional[str] = None
+        self.labels = list(dict.fromkeys(str(label) for label in labels if str(label).strip()))
+        self.filtered = self.labels[:]
+        self.current = str(current or "").strip()
+        self._filter_after_id: Optional[str] = None
+        self._render_after_id: Optional[str] = None
+        self._max_render = 140
+        self.title(title)
+        self.configure(fg_color=THEME["panel"])
+        self.transient(master)
+        center_toplevel(self, master, 860, 620)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        ctk.CTkLabel(self, text=title, text_color=THEME["text"], font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 4))
+        ctk.CTkLabel(
+            self,
+            text="Search is keyboard-first: type part of the product ID, asset, expiry, quote currency, or display name. Only a small page is rendered so huge Coinbase product lists stay responsive.",
+            text_color=THEME["muted"],
+            justify="left",
+            wraplength=800,
+        ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 6))
+
+        self.current_label = ctk.CTkLabel(
+            self,
+            text=f"Current: {self.current or '—'}",
+            text_color=THEME["accent_3"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.current_label.grid(row=2, column=0, sticky="w", padx=18, pady=(0, 8))
+
+        search_row = ctk.CTkFrame(self, fg_color="transparent")
+        search_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 8))
+        search_row.grid_columnconfigure(0, weight=1)
+        self.search_var = tk.StringVar(value="")
+        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, placeholder_text="Search markets, e.g. BTC, ARB, ETH-USD, NOL, 18MAY26, USDC")
+        self.search_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(search_row, text="Clear", width=72, command=self._clear_search, fg_color=THEME["card_soft"]).grid(row=0, column=1, padx=(8, 0))
+        if self.current:
+            ctk.CTkButton(search_row, text="Use Current", width=104, command=lambda: self._select(self.current), fg_color=THEME["line"]).grid(row=0, column=2, padx=(8, 0))
+
+        self.search_entry.bind("<KeyRelease>", self._on_search_keyrelease)
+        self.search_entry.bind("<Return>", self._select_first)
+        self.search_entry.bind("<Escape>", lambda _event: self._cancel())
+        self.search_entry.bind("<Control-a>", self._select_search_text)
+        self.search_entry.bind("<Control-A>", self._select_search_text)
+
+        self.list_frame = ctk.CTkScrollableFrame(self, fg_color=THEME["card"], corner_radius=14, height=370)
+        self.list_frame.grid(row=4, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        self.list_frame.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(self, text="", text_color=THEME["muted"], font=ctk.CTkFont(size=11))
+        self.status_label.grid(row=5, column=0, sticky="w", padx=18, pady=(0, 8))
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(buttons, text="Select First Match", command=lambda: self._select_first(None), fg_color=THEME["accent"], text_color="#121212").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(buttons, text="Cancel", command=self._cancel, fg_color=THEME["card_soft"]).grid(row=0, column=1, sticky="e")
+
+        self._filter(immediate=True)
+        self.after(80, self._focus_search_entry)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _focus_search_entry(self) -> None:
+        try:
+            self.search_entry.focus_force()
+            self.search_entry.icursor("end")
+        except Exception:
+            pass
+
+    def _select_search_text(self, _event=None):
+        try:
+            self.search_entry.select_range(0, "end")
+            self.search_entry.icursor("end")
+        except Exception:
+            pass
+        return "break"
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self._filter(immediate=True)
+        self._focus_search_entry()
+
+    def _on_search_keyrelease(self, _event=None) -> None:
+        # Debounce filtering so fast typing is not interrupted by widget rebuilds.
+        if self._filter_after_id:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except Exception:
+                pass
+        self._filter_after_id = self.after(90, self._filter)
+
+    @staticmethod
+    def _score_label(label: str, terms: List[str]) -> Tuple[int, str]:
+        upper = label.upper()
+        product = upper.split(" — ", 1)[0]
+        score = 0
+        for term in terms:
+            if product == term:
+                score += 1000
+            elif product.startswith(term):
+                score += 500
+            elif term in product:
+                score += 250
+            elif term in upper:
+                score += 80
+        return (-score, upper)
+
+    def _filter(self, immediate: bool = False) -> None:
+        self._filter_after_id = None
+        query = sanitize_structured_text(self.search_var.get(), max_chars=120).upper()
+        # Let users paste common separators; searching "ARB/USD" should find ARB-USD.
+        query = query.replace("/", "-").replace("_", "-").replace(":", " ")
+        terms = [term for term in re.split(r"\s+", query) if term]
+        if terms:
+            normalized_labels = [(label, label.upper().replace("/", "-").replace("_", "-")) for label in self.labels]
+            matched = [label for label, normalized in normalized_labels if all(term in normalized for term in terms)]
+            matched.sort(key=lambda label: self._score_label(label, terms))
+            self.filtered = matched
+        else:
+            self.filtered = self.labels[:]
+        if immediate:
+            self._render()
+            return
+        if self._render_after_id:
+            try:
+                self.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+        self._render_after_id = self.after(10, self._render)
+
+    def _render(self) -> None:
+        self._render_after_id = None
+        try:
+            for child in self.list_frame.winfo_children():
+                child.destroy()
+        except Exception:
+            return
+        visible = self.filtered[: self._max_render]
+        if not visible:
+            ctk.CTkLabel(
+                self.list_frame,
+                text="No matching Coinbase products. Try a shorter search like BTC, ETH, USD, USDC, NOL, or the expiry month.",
+                text_color=THEME["muted"],
+                justify="left",
+                wraplength=760,
+            ).grid(row=0, column=0, sticky="ew", padx=10, pady=12)
+        for row, label in enumerate(visible):
+            is_current = self.current and label == self.current
+            ctk.CTkButton(
+                self.list_frame,
+                text=("✓ " if is_current else "") + label,
+                anchor="w",
+                height=34,
+                fg_color=THEME["line"] if is_current else THEME["card_soft"],
+                hover_color=THEME["line"],
+                text_color=THEME["text"],
+                command=lambda value=label: self._select(value),
+            ).grid(row=row, column=0, sticky="ew", padx=8, pady=3)
+        extra = max(0, len(self.filtered) - len(visible))
+        suffix = f" · showing {len(visible)} at a time; keep typing to narrow {extra} more" if extra else ""
+        self.status_label.configure(text=f"{len(self.filtered)} matching products{suffix} · Enter selects first match · Esc cancels")
+        self.after(1, self._focus_search_entry)
+
+    def _select_first(self, _event=None):
+        if self.filtered:
+            self._select(self.filtered[0])
+        return "break"
+
+    def _select(self, value: str) -> None:
+        self.result = value
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def show_modal(self) -> Optional[str]:
+        # Tk can raise "grab failed: window not viewable" if grab_set happens
+        # before the toplevel has actually been mapped. Wait for visibility and
+        # then use a local grab; if the window manager still refuses the grab,
+        # keep the picker usable without blocking the entire app.
+        try:
+            self.deiconify()
+            self.lift()
+            self.wait_visibility()
+        except Exception:
+            pass
+        try:
+            self.grab_set()
+        except tk.TclError:
+            try:
+                self.after(120, self.grab_set)
+            except Exception:
+                pass
+        self._focus_search_entry()
+        self.wait_window()
+        return self.result
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -2811,6 +3655,9 @@ class App(ctk.CTk):
         self.prompt_library_flat: Dict[str, str] = {}
         self.selected_prompt_name = ""
         self.coinbase = CoinbaseAdvancedClient(self.settings)
+        self.product_store = EncryptedProductStore(PRODUCT_CACHE_DB_PATH)
+        self.available_products: List[Dict[str, Any]] = []
+        self.product_label_to_id: Dict[str, str] = {}
         self.alpha = AdvancedAlphaEngine()
         self.sensor = QuantumRGBSensor()
         self.memory = EntropicRAGMemory(limit=int(self.settings.data.get("rag_memory_limit", 120)))
@@ -2824,6 +3671,7 @@ class App(ctk.CTk):
         self.vision_image_path: Optional[str] = None
         self.autonomy_cooldown = deque(maxlen=10)
         self._refreshing = False
+        self._refresh_token = 0
         self._model_download_in_progress = False
         self.last_market_error = ""
         self.vault_master_key: Optional[bytes] = None
@@ -2831,9 +3679,15 @@ class App(ctk.CTk):
         self.vault_unlocked = False
         self._startup_workflow_ran = False
         self._coinbase_private_key_plain = ""
+        self.chart_fullscreen_active = False
+        self.side_tray_hidden = bool(self.settings.data.get("side_tray_hidden", False))
 
         self._build()
         self._load_settings_into_widgets()
+        self._select_initial_tab()
+        self.bind("<F11>", lambda event: self.toggle_chart_fullscreen())
+        self.bind("<Escape>", self.exit_chart_fullscreen)
+        self.bind("<F10>", lambda event: self.toggle_side_tray())
         self.refresh_market()
         self.after(max(5, int(self.settings.data.get("refresh_seconds", 30))) * 1000, self._schedule_refresh)
         self.after(180, self._run_startup_workflows)
@@ -2843,6 +3697,7 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         header = ctk.CTkFrame(self, fg_color=THEME["canvas"], corner_radius=0)
+        self.header_frame = header
         header.grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(header, text=APP_NAME, text_color=THEME["text"], font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w", padx=22, pady=(12, 0))
         ctk.CTkLabel(
@@ -2853,16 +3708,20 @@ class App(ctk.CTk):
         ).pack(anchor="w", padx=22, pady=(0, 12))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body_frame = body
         body.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
         body.grid_columnconfigure(0, weight=2)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
         body.grid_rowconfigure(1, weight=1)
 
-        self.chart = DerivativesChartPanel(body)
+        self.chart = DerivativesChartPanel(body, timeframe_callback=self.set_primary_timeframe, fullscreen_callback=self.toggle_chart_fullscreen, product_callback=self.open_central_market_picker, vault_callback=self.unlock_secrets)
         self.chart.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 10))
+        self.chart.set_vault_state(bool(self.vault_unlocked and self.coinbase.secrets), bool(self.settings.data.get("secrets")))
+        self.chart.set_side_tray_state(bool(getattr(self, "side_tray_hidden", False)))
 
         right = ctk.CTkFrame(body, fg_color="transparent")
+        self.right_panel = right
         right.grid(row=0, column=1, rowspan=2, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(0, weight=3)
@@ -2947,6 +3806,77 @@ class App(ctk.CTk):
         self._build_trade_tab()
         self._build_prompt_tab()
         self._build_settings_tab()
+        self._apply_side_tray_state(persist=False)
+
+    def toggle_side_tray(self) -> None:
+        self.side_tray_hidden = not bool(getattr(self, "side_tray_hidden", False))
+        self._apply_side_tray_state(persist=True)
+
+    def _apply_side_tray_state(self, *, persist: bool = False) -> None:
+        hidden = bool(getattr(self, "side_tray_hidden", False))
+        try:
+            if bool(getattr(self, "chart_fullscreen_active", False)):
+                if hasattr(self, "chart"):
+                    self.chart.set_side_tray_state(hidden)
+                return
+            if hidden:
+                self.right_panel.grid_remove()
+                self.body_frame.grid_columnconfigure(0, weight=1)
+                self.body_frame.grid_columnconfigure(1, weight=0)
+                self.chart.grid_configure(row=0, column=0, rowspan=2, sticky="nsew", padx=0, pady=0)
+            else:
+                self.body_frame.grid_columnconfigure(0, weight=2)
+                self.body_frame.grid_columnconfigure(1, weight=1)
+                self.chart.grid_configure(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 10), pady=0)
+                self.right_panel.grid(row=0, column=1, rowspan=2, sticky="nsew")
+            if hasattr(self, "chart"):
+                self.chart.set_side_tray_state(hidden)
+            if hasattr(self, "side_tray_switch"):
+                if hidden:
+                    self.side_tray_switch.select()
+                else:
+                    self.side_tray_switch.deselect()
+            if persist:
+                self.settings.data["side_tray_hidden"] = hidden
+                self.settings.save()
+        except Exception as exc:
+            messagebox.showerror("Side tray", f"Could not toggle the side tray.\n\n{exc}")
+
+    def toggle_chart_fullscreen(self) -> None:
+        self.chart_fullscreen_active = not bool(getattr(self, "chart_fullscreen_active", False))
+        self._apply_chart_fullscreen_state()
+
+    def _apply_chart_fullscreen_state(self) -> None:
+        active = bool(getattr(self, "chart_fullscreen_active", False))
+        try:
+            if active:
+                self.right_panel.grid_remove()
+                self.header_frame.grid_remove()
+                self.body_frame.grid_configure(padx=0, pady=0)
+                self.body_frame.grid_columnconfigure(0, weight=1)
+                self.body_frame.grid_columnconfigure(1, weight=0)
+                self.chart.grid_configure(row=0, column=0, rowspan=2, sticky="nsew", padx=0, pady=0)
+                self.attributes("-fullscreen", True)
+            else:
+                self.attributes("-fullscreen", False)
+                self.header_frame.grid()
+                self.body_frame.grid_configure(padx=14, pady=14)
+                self._apply_side_tray_state(persist=False)
+            if hasattr(self, "chart"):
+                self.chart.set_fullscreen_state(active)
+                self.chart.set_side_tray_state(bool(getattr(self, "side_tray_hidden", False)))
+        except Exception as exc:
+            try:
+                self.attributes("-fullscreen", False)
+            except Exception:
+                pass
+            self.chart_fullscreen_active = False
+            messagebox.showerror("Fullscreen", f"Could not toggle fullscreen chart mode: {exc}")
+
+    def exit_chart_fullscreen(self, event: Optional[Any] = None) -> None:
+        if bool(getattr(self, "chart_fullscreen_active", False)):
+            self.chart_fullscreen_active = False
+            self._apply_chart_fullscreen_state()
 
     def _build_setup_tab(self) -> None:
         host = self.setup_tab
@@ -2992,13 +3922,12 @@ class App(ctk.CTk):
         ctk.CTkButton(setup_key_actions, text="Load Key File", command=self._load_private_key_file, width=118, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=6)
         ctk.CTkButton(setup_key_actions, text="Clear", command=self._clear_private_key_value, width=86, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(6, 0))
 
-        ctk.CTkLabel(tab, text="Perp Product", text_color=THEME["muted"]).grid(row=7, column=0, sticky="w", padx=12, pady=6)
-        self.setup_product_id_entry = ctk.CTkEntry(tab, placeholder_text="ETH-PERP")
-        self.setup_product_id_entry.grid(row=7, column=1, sticky="ew", padx=(6, 12), pady=6)
-
-        ctk.CTkLabel(tab, text="Reference Spot Product", text_color=THEME["muted"]).grid(row=8, column=0, sticky="w", padx=12, pady=6)
-        self.setup_reference_product_entry = ctk.CTkEntry(tab, placeholder_text="ETH-USD")
-        self.setup_reference_product_entry.grid(row=8, column=1, sticky="ew", padx=(6, 12), pady=6)
+        ctk.CTkLabel(tab, text="Market selection", text_color=THEME["muted"]).grid(row=7, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkButton(tab, text="Use Chart Market Button", command=self.open_central_market_picker, fg_color=THEME["accent_3"], text_color="#08131f").grid(row=7, column=1, sticky="ew", padx=(6, 12), pady=6)
+        self.setup_product_id_entry = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("product_id", "ETH-PERP"))], state="normal")
+        self.setup_product_id_entry.set(str(self.settings.data.get("product_id", "ETH-PERP")))
+        self.setup_reference_product_entry = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("reference_product_id", "ETH-USD"))], state="normal")
+        self.setup_reference_product_entry.set(str(self.settings.data.get("reference_product_id", "ETH-USD")))
 
         ctk.CTkLabel(tab, text="Gemma Model Path", text_color=THEME["muted"]).grid(row=9, column=0, sticky="w", padx=12, pady=6)
         self.setup_model_path_entry = ctk.CTkEntry(tab, placeholder_text=DEFAULT_MODEL_PATH)
@@ -3006,11 +3935,12 @@ class App(ctk.CTk):
 
         actions = ctk.CTkFrame(tab, fg_color="transparent")
         actions.grid(row=10, column=0, columnspan=2, sticky="ew", padx=12, pady=(10, 10))
-        actions.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        actions.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         ctk.CTkButton(actions, text="Download Model", command=self.download_model_action, fg_color=THEME["accent_2"], text_color="#08131f").grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ctk.CTkButton(actions, text="Save + Unlock", command=self.save_initial_setup_action, fg_color=THEME["accent"], text_color="#121212").grid(row=0, column=1, sticky="ew", padx=6)
-        ctk.CTkButton(actions, text="Refresh Market", command=self.refresh_market, fg_color=THEME["accent_3"], text_color="#08131f").grid(row=0, column=2, sticky="ew", padx=6)
-        ctk.CTkButton(actions, text="Open Settings", command=lambda: self.tabs.set("Settings"), fg_color=THEME["card_soft"]).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        ctk.CTkButton(actions, text="Refresh Products", command=self.refresh_products_action, fg_color=THEME["card_soft"]).grid(row=0, column=2, sticky="ew", padx=6)
+        ctk.CTkButton(actions, text="Refresh Market", command=self.refresh_market, fg_color=THEME["accent_3"], text_color="#08131f").grid(row=0, column=3, sticky="ew", padx=6)
+        ctk.CTkButton(actions, text="Open Settings", command=lambda: self.tabs.set("Settings"), fg_color=THEME["card_soft"]).grid(row=0, column=4, sticky="ew", padx=(6, 0))
 
         self.setup_status_box = ctk.CTkTextbox(tab, height=240, fg_color=THEME["card"], text_color=THEME["text"], border_color=THEME["line"], border_width=1, corner_radius=14)
         self.setup_status_box.grid(row=11, column=0, columnspan=2, sticky="nsew", padx=12, pady=(4, 12))
@@ -3110,29 +4040,64 @@ class App(ctk.CTk):
         tab = self.trade_tab
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_columnconfigure(1, weight=1)
-        tab.grid_rowconfigure(6, weight=1)
-        ctk.CTkLabel(tab, text="Execution rail is optional. Paper mode is the default.", text_color=THEME["muted"]).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+        tab.grid_rowconfigure(10, weight=1)
+        ctk.CTkLabel(
+            tab,
+            text="Execution rail is optional. Paper mode is the default. Use the Market button beside chart zoom to change products globally.",
+            text_color=THEME["muted"],
+            wraplength=720,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        market_status = ctk.CTkFrame(tab, fg_color=THEME["card"], corner_radius=16)
+        market_status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        market_status.grid_columnconfigure(0, weight=1)
+        self.trade_market_label = ctk.CTkLabel(
+            market_status,
+            text=f"Active market: {self.settings.data.get('product_id', 'ETH-PERP')} · Reference: {self.settings.data.get('reference_product_id', 'ETH-USD')}",
+            text_color=THEME["text"],
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        self.trade_market_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        ctk.CTkButton(market_status, text="Change Market Near Chart Zoom", command=self.open_central_market_picker, fg_color=THEME["accent_3"], text_color="#08131f").grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+        # Hidden canonical widgets preserve compatibility with preview/place logic while removing duplicate market selectors.
+        self.trade_product_combo = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("product_id", "ETH-PERP"))], state="normal")
+        self.trade_product_combo.set(str(self.settings.data.get("product_id", "ETH-PERP")))
+        self.trade_reference_combo = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("reference_product_id", "ETH-USD"))], state="normal")
+        self.trade_reference_combo.set(str(self.settings.data.get("reference_product_id", "ETH-USD")))
+
         self.order_side = ctk.CTkComboBox(tab, values=["BUY", "SELL"])
         self.order_side.set("BUY")
-        self.order_side.grid(row=1, column=0, sticky="ew", padx=(12, 6), pady=6)
+        self.order_side.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=6)
         self.order_quote_size = ctk.CTkEntry(tab, placeholder_text="Quote size in USD")
         self.order_quote_size.insert(0, str(self.settings.data.get("default_order_quote_size", 25.0)))
-        self.order_quote_size.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=6)
+        self.order_quote_size.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=6)
         self.order_leverage = ctk.CTkEntry(tab, placeholder_text="Leverage")
         self.order_leverage.insert(0, str(self.settings.data.get("default_order_leverage", 3.0)))
-        self.order_leverage.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=6)
+        self.order_leverage.grid(row=3, column=0, sticky="ew", padx=(12, 6), pady=6)
         self.margin_type_combo = ctk.CTkComboBox(tab, values=["CROSS", "ISOLATED", ""])
         self.margin_type_combo.set(str(self.settings.data.get("margin_type", "CROSS")))
-        self.margin_type_combo.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=6)
+        self.margin_type_combo.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=6)
         self.autonomy_size_label = ctk.CTkLabel(tab, text="—", text_color=THEME["text"])
-        ctk.CTkLabel(tab, text="Autonomy Proposed Size", text_color=THEME["muted"]).grid(row=3, column=0, sticky="w", padx=12, pady=(2, 0))
-        self.autonomy_size_label.grid(row=3, column=1, sticky="w", padx=12, pady=(2, 0))
-        ctk.CTkButton(tab, text="Seed From Signal", command=self.seed_trade_from_surface, fg_color=THEME["card_soft"]).grid(row=4, column=0, sticky="ew", padx=(12, 6), pady=6)
-        ctk.CTkButton(tab, text="Preview Order", command=self.preview_order, fg_color=THEME["accent_2"], text_color="#08131f").grid(row=4, column=1, sticky="ew", padx=(6, 12), pady=6)
-        ctk.CTkButton(tab, text="Place Live Order", command=self.place_order, fg_color=THEME["danger"]).grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
+        ctk.CTkLabel(tab, text="Autonomy Proposed Size", text_color=THEME["muted"]).grid(row=4, column=0, sticky="w", padx=12, pady=(2, 0))
+        self.autonomy_size_label.grid(row=4, column=1, sticky="w", padx=12, pady=(2, 0))
+        ctk.CTkButton(tab, text="Seed From Signal", command=self.seed_trade_from_surface, fg_color=THEME["card_soft"]).grid(row=5, column=0, sticky="ew", padx=(12, 6), pady=6)
+        ctk.CTkButton(tab, text="Preview Order", command=self.preview_order, fg_color=THEME["accent_2"], text_color="#08131f").grid(row=5, column=1, sticky="ew", padx=(6, 12), pady=6)
+        ctk.CTkButton(tab, text="Place Live Order", command=self.place_order, fg_color=THEME["danger"]).grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
+
+        ai_card = ctk.CTkFrame(tab, fg_color=THEME["card"], corner_radius=16)
+        ai_card.grid(row=7, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 8))
+        ai_card.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkLabel(ai_card, text="AI trading replies", text_color=THEME["text"], font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(10, 4))
+        ctk.CTkButton(ai_card, text="AI Market Read", command=lambda: self.ask_trade_ai("market_read"), fg_color=THEME["accent"], text_color="#121212").grid(row=1, column=0, sticky="ew", padx=(12, 4), pady=(2, 12))
+        ctk.CTkButton(ai_card, text="AI Risk Audit", command=lambda: self.ask_trade_ai("risk_audit"), fg_color=THEME["card_soft"]).grid(row=1, column=1, sticky="ew", padx=4, pady=(2, 12))
+        ctk.CTkButton(ai_card, text="AI Execution Plan", command=lambda: self.ask_trade_ai("execution_plan"), fg_color=THEME["accent_2"], text_color="#08131f").grid(row=1, column=2, sticky="ew", padx=(4, 12), pady=(2, 12))
+
         self.trade_log = ctk.CTkTextbox(tab, fg_color=THEME["card"], text_color=THEME["text"], border_color=THEME["line"], border_width=1, corner_radius=14)
-        self.trade_log.grid(row=6, column=0, columnspan=2, sticky="nsew", padx=12, pady=(6, 12))
-        self.trade_log.insert("1.0", "Execution notes:\n- Preview rail uses Coinbase Advanced Trade when credentials are unlocked.\n- Live rail requires explicit enablement and explicit confirmation.\n- Income rails are research frameworks, not profit guarantees.\n")
+        self.trade_log.grid(row=10, column=0, columnspan=2, sticky="nsew", padx=12, pady=(6, 12))
+        self.trade_log.insert("1.0", "Execution notes:\n- Market selection is centralized in one place: the Market button beside chart Zoom +/- controls.\n- Trading, chart, settings, preview, and live-order code all read the same saved product_id.\n- AI trading replies use the active market packet and fall back to local signal-lab commentary if Gemma is unavailable.\n- Live rail requires explicit enablement and explicit confirmation.\n- Income rails are research frameworks, not profit guarantees.\n")
 
     def _build_prompt_tab(self) -> None:
         tab = self.prompt_tab
@@ -3182,8 +4147,6 @@ class App(ctk.CTk):
         tab.grid_columnconfigure(1, weight=1)
         labels = [
             ("Model Path", "model_path_entry"),
-            ("Product ID", "product_id_entry"),
-            ("Reference Spot Product", "reference_product_entry"),
             ("Refresh Seconds", "refresh_entry"),
             ("Primary Timeframe Minutes", "tf_primary_entry"),
             ("Secondary Timeframe Minutes", "tf_secondary_entry"),
@@ -3197,10 +4160,21 @@ class App(ctk.CTk):
         row = 0
         for label, name in labels:
             ctk.CTkLabel(tab, text=label, text_color=THEME["muted"]).grid(row=row, column=0, sticky="w", padx=12, pady=(12 if row == 0 else 6, 6))
-            entry = ctk.CTkEntry(tab)
+            if name in {"product_id_entry", "reference_product_entry"}:
+                entry = ctk.CTkComboBox(tab, values=["ETH-PERP", "ETH-USD", "NOL-18MAY26-CDE"], state="normal")
+            else:
+                entry = ctk.CTkEntry(tab)
             entry.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=(12 if row == 0 else 6, 6))
             setattr(self, name, entry)
             row += 1
+
+        self.product_id_entry = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("product_id", "ETH-PERP"))], state="normal")
+        self.product_id_entry.set(str(self.settings.data.get("product_id", "ETH-PERP")))
+        self.reference_product_entry = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("reference_product_id", "ETH-USD"))], state="normal")
+        self.reference_product_entry.set(str(self.settings.data.get("reference_product_id", "ETH-USD")))
+        ctk.CTkLabel(tab, text="Market", text_color=THEME["muted"]).grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkButton(tab, text="Change Global Market Near Chart Zoom", command=self.open_central_market_picker, fg_color=THEME["accent_3"], text_color="#08131f").grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
+        row += 1
 
         ctk.CTkLabel(tab, text="Vault Passphrase", text_color=THEME["muted"]).grid(row=row, column=0, sticky="w", padx=12, pady=6)
         self.vault_passphrase_entry = ctk.CTkEntry(tab, show="*", placeholder_text="Optional: leave blank to use the vault popup")
@@ -3231,6 +4205,9 @@ class App(ctk.CTk):
         self.jwt_algo_combo.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
         row += 1
 
+        ctk.CTkButton(tab, text="Refresh Coinbase Product Dropdowns", command=self.refresh_products_action, fg_color=THEME["card_soft"]).grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
+        row += 1
+
         self.paper_mode_switch = ctk.CTkSwitch(tab, text="Paper trading enabled")
         self.paper_mode_switch.grid(row=row, column=0, sticky="w", padx=12, pady=6)
         self.live_mode_switch = ctk.CTkSwitch(tab, text="Allow live trading")
@@ -3253,6 +4230,8 @@ class App(ctk.CTk):
         row += 1
         self.ema233_switch = ctk.CTkSwitch(tab, text="Show EMA 233")
         self.ema233_switch.grid(row=row, column=0, sticky="w", padx=12, pady=6)
+        self.side_tray_switch = ctk.CTkSwitch(tab, text="Hide side tray / enlarge chart")
+        self.side_tray_switch.grid(row=row, column=1, sticky="w", padx=12, pady=6)
         row += 1
 
         btns = ctk.CTkFrame(tab, fg_color="transparent")
@@ -3287,7 +4266,8 @@ class App(ctk.CTk):
             "- Unlock uses an in-session popup and key rotation can reseal the bundle with a fresh master key.\n"
             "- Download Model fetches the default Gemma 4 LiteRT file and verifies its SHA256.\n"
             "- The RGB / Pennylane sensor is bounded auxiliary context.\n"
-            "- Entropic RAG memory only uses in-session derived states.\n",
+            "- Entropic RAG memory only uses in-session derived states.\n"
+            "- Use the Hide Tray button beside chart zoom for a large chart without fullscreen.\n",
         )
 
     def _seed_chat_prompt(self, prompt: str) -> None:
@@ -3535,6 +4515,8 @@ class App(ctk.CTk):
         self.vault_mode = self.settings.vault_mode()
         if hasattr(self, "vault_status_label"):
             self.vault_status_label.configure(text=self._vault_status_text())
+        if hasattr(self, "chart"):
+            self.chart.set_vault_state(bool(self.vault_unlocked and self.coinbase.secrets), bool(self.settings.data.get("secrets")))
         self._refresh_startup_checklist()
 
     def _unlock_vault_with_password(self, password: str, *, quiet: bool = False) -> bool:
@@ -3644,17 +4626,187 @@ class App(ctk.CTk):
         if self._startup_workflow_ran:
             return
         self._startup_workflow_ran = True
+        self._mark_startup_flow_complete_if_ready()
+        self._select_initial_tab()
+        # Do not auto-open the first-start workflow anymore. It is available only
+        # through Settings -> Replay Startup Guide. A saved vault still prompts
+        # to unlock when that startup setting is enabled.
         state = self.settings.vault_security()
-        if self._initial_setup_needed() and not bool(state.get("startup_setup_popup_seen")):
-            self.settings.note_startup_setup_popup_seen()
-            self.open_startup_setup_dialog(force=True)
         if bool(self.settings.data.get("secrets")) and bool(state.get("prompt_on_startup", True)) and not self.coinbase.secrets:
             self.ensure_secrets_unlocked(startup_prompt=True)
+        self._select_initial_tab()
 
     def _refresh_startup_checklist(self) -> None:
         if not hasattr(self, "setup_checklist_label"):
             return
         self.setup_checklist_label.configure(text=self._startup_checklist_text())
+
+    @staticmethod
+    def _get_widget_text(widget: Any) -> str:
+        try:
+            return str(widget.get()).strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _set_widget_text(widget: Any, value: Any) -> None:
+        text = str(value or "")
+        if hasattr(widget, "set"):
+            try:
+                widget.set(text)
+                return
+            except Exception:
+                pass
+        try:
+            widget.delete(0, "end")
+            widget.insert(0, text)
+        except Exception:
+            pass
+
+    def _product_dropdown_labels(self) -> List[str]:
+        labels = list(getattr(self, "product_label_to_id", {}).keys())
+        if not labels:
+            labels = ["ETH-PERP", "ETH-USD", "BTC-USD", "NOL-18MAY26-CDE"]
+        for fallback in ("ETH-PERP", "ETH-USD", "BTC-USD", "NOL-18MAY26-CDE"):
+            if fallback not in labels:
+                labels.append(fallback)
+        return labels
+
+    def _label_for_product_id(self, product_id: str) -> str:
+        clean = sanitize_product_id(product_id, default=str(product_id or ""))
+        for label, pid in getattr(self, "product_label_to_id", {}).items():
+            if pid == clean:
+                return label
+        return clean
+
+    def open_central_market_picker(self) -> None:
+        """Single global market selector used by chart, trading, settings, and order routing."""
+        current = self._label_for_product_id(str(self.settings.data.get("product_id", "ETH-PERP")))
+        dialog = ProductPickerDialog(self, title="Select Global Coinbase Market", labels=self._product_dropdown_labels(), current=current)
+        selected = dialog.show_modal()
+        if not selected:
+            return
+        product_id = getattr(self, "product_label_to_id", {}).get(selected, sanitize_product_id(str(selected).split(" — ", 1)[0], default="ETH-PERP"))
+        previous_product = sanitize_product_id(self.settings.data.get("product_id"), default="ETH-PERP")
+        previous_reference = sanitize_product_id(self.settings.data.get("reference_product_id"), default="ETH-USD")
+        reference_id = self._default_reference_for_product(product_id, previous_reference if product_id == previous_product else "")
+        self._apply_global_market(product_id, reference_id, refresh=True)
+
+    def _apply_global_market(self, product_id: str, reference_id: str = "", *, refresh: bool = True) -> None:
+        product_id = sanitize_product_id(product_id, default="ETH-PERP")
+        reference_id = sanitize_product_id(reference_id, default=self._default_reference_for_product(product_id, ""))
+        self.settings.data["product_id"] = product_id
+        self.settings.data["reference_product_id"] = reference_id
+        self.settings.save()
+        self._sync_market_dropdown_values()
+        if hasattr(self, "chart"):
+            self.chart.set_market_label(product_id, reference_id)
+        if hasattr(self, "trade_log"):
+            self.trade_log.insert("end", f"Global market set to {product_id} with reference {reference_id}.\n")
+            self.trade_log.see("end")
+        self._append_settings_status(f"Global market set to {product_id}; reference set to {reference_id}.")
+        if refresh:
+            self.refresh_market(force=True)
+
+    def _open_product_picker(self, widget_name: str, *, apply_after: bool = False) -> None:
+        widget = getattr(self, widget_name, None)
+        current = self._get_widget_text(widget) if widget is not None else ""
+        dialog = ProductPickerDialog(self, title="Select Coinbase Product", labels=self._product_dropdown_labels(), current=current)
+        selected = dialog.show_modal()
+        if not selected:
+            return
+        if widget is not None:
+            self._set_widget_text(widget, selected)
+        if apply_after:
+            self.apply_trade_market_selection()
+
+    def _sync_market_dropdown_values(self) -> None:
+        product_id = self.settings.data.get("product_id", "ETH-PERP")
+        reference_id = self.settings.data.get("reference_product_id", "ETH-USD")
+        for name, value in (("product_id_entry", product_id), ("setup_product_id_entry", product_id), ("trade_product_combo", product_id)):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                self._set_widget_text(widget, value)
+        for name, value in (("reference_product_entry", reference_id), ("setup_reference_product_entry", reference_id), ("trade_reference_combo", reference_id)):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                self._set_widget_text(widget, value)
+        if hasattr(self, "trade_market_label"):
+            try:
+                self.trade_market_label.configure(text=f"Active market: {product_id} · Reference: {reference_id}")
+            except Exception:
+                pass
+        if hasattr(self, "chart"):
+            self.chart.set_market_label(product_id, reference_id)
+
+    def _default_reference_for_product(self, product_id: str, current_reference: str = "") -> str:
+        product_id = sanitize_product_id(product_id, default="ETH-PERP")
+        current_reference = sanitize_product_id(current_reference, default="")
+        if product_id.endswith("-PERP"):
+            return product_id.removesuffix("-PERP") + "-USD"
+        if product_id.endswith("-PERP-INTX"):
+            return product_id.removesuffix("-PERP-INTX") + "-USD"
+        if product_id.endswith("-USDC"):
+            return product_id.removesuffix("-USDC") + "-USD"
+        if re.match(r"^[A-Z]{2,4}-\d{1,2}[A-Z]{3}\d{2}-CDE$", product_id):
+            return product_id
+        if product_id.endswith("-USD"):
+            return product_id
+        return current_reference or product_id
+
+    def apply_trade_market_selection(self) -> None:
+        product_id = self._extract_product_id_from_widget(getattr(self, "trade_product_combo", None), self.settings.data.get("product_id", "ETH-PERP"))
+        reference_id = self._extract_product_id_from_widget(getattr(self, "trade_reference_combo", None), self._default_reference_for_product(product_id, ""))
+        self._apply_global_market(product_id, reference_id, refresh=True)
+
+    def _configure_product_dropdowns(self, labels: List[str]) -> None:
+        values = labels or ["ETH-PERP", "ETH-USD", "NOL-18MAY26-CDE"]
+        for name in ("product_id_entry", "setup_product_id_entry", "reference_product_entry", "setup_reference_product_entry", "trade_product_combo", "trade_reference_combo"):
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "configure"):
+                try:
+                    widget.configure(values=values)
+                except Exception:
+                    pass
+
+    def _extract_product_id_from_widget(self, widget: Any, default: str) -> str:
+        raw = self._get_widget_text(widget)
+        if raw in self.product_label_to_id:
+            return self.product_label_to_id[raw]
+        return sanitize_product_id(raw.split(" — ", 1)[0], default=default)
+
+    def _refresh_product_dropdowns_from_products(self, products: List[Dict[str, Any]]) -> None:
+        labels: List[str] = []
+        mapping: Dict[str, str] = {}
+        for product in products:
+            pid = sanitize_product_id(product.get("product_id"), default="")
+            if not pid:
+                continue
+            label = safe_product_label(product)
+            labels.append(label)
+            mapping[label] = pid
+        for fallback in ("ETH-PERP", "ETH-USD", "NOL-18MAY26-CDE"):
+            if fallback not in mapping.values():
+                labels.append(fallback)
+                mapping[fallback] = fallback
+        self.product_label_to_id = mapping
+        self._configure_product_dropdowns(labels)
+        self._sync_market_dropdown_values()
+
+    def refresh_products_action(self) -> None:
+        def worker() -> None:
+            try:
+                products = self.coinbase.list_products(master_key=self.vault_master_key, cache=self.product_store)
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._append_settings_status(f"Product refresh failed: {e}"))
+                return
+
+            def done() -> None:
+                self.available_products = products
+                self._refresh_product_dropdowns_from_products(products)
+                self._append_settings_status(f"Loaded {len(products)} Coinbase products into dropdowns. Oil futures product NOL-18MAY26-CDE is available.")
+            self.after(0, done)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _sync_setup_widgets_from_settings_widgets(self) -> None:
         if not hasattr(self, "setup_model_path_entry"):
@@ -3666,8 +4818,7 @@ class App(ctk.CTk):
             (self.coinbase_api_key_entry, self.setup_coinbase_api_key_entry),
         ]
         for source, target in pairs:
-            target.delete(0, "end")
-            target.insert(0, source.get())
+            self._set_widget_text(target, self._get_widget_text(source))
         self._render_private_key_preview()
         self._refresh_startup_checklist()
 
@@ -3681,20 +4832,49 @@ class App(ctk.CTk):
             (self.setup_coinbase_api_key_entry, self.coinbase_api_key_entry),
         ]
         for source, target in pairs:
-            target.delete(0, "end")
-            target.insert(0, source.get())
+            self._set_widget_text(target, self._get_widget_text(source))
         self._render_private_key_preview()
 
     def _initial_setup_needed(self) -> bool:
-        return not self._current_model_path().is_file() or not bool(self.settings.data.get("secrets"))
+        """Only show first-start automatically for a truly new profile.
+
+        Missing model files or sealed credentials should be reported in status panels,
+        but they should not force returning users back into the Setup tab forever.
+        """
+        try:
+            state = self.settings.vault_security()
+            if bool(state.get("startup_flow_complete")) or bool(state.get("startup_setup_popup_seen")):
+                return False
+            if SETTINGS_PATH.exists():
+                return False
+        except Exception:
+            return False
+        return True
 
     def _select_initial_tab(self) -> None:
-        self.tabs.set("Setup" if self._initial_setup_needed() else "Chat")
+        """Launch into Trading. Setup is opened only when the user explicitly chooses it."""
+        try:
+            self.tabs.set("Trading")
+        except Exception:
+            pass
+
+    def _mark_startup_flow_complete_if_ready(self) -> None:
+        """Persist that first-run guidance is complete when the user saves or dismisses setup."""
+        try:
+            state = self.settings.vault_security()
+            state["startup_flow_complete"] = True
+            state["startup_setup_popup_seen"] = True
+            self.settings.data["vault_security"] = state
+            self.settings.save()
+        except Exception:
+            pass
 
     def save_initial_setup_action(self) -> None:
         self._sync_settings_widgets_from_setup_widgets()
         self.save_settings_action()
         self._sync_setup_widgets_from_settings_widgets()
+        self._mark_startup_flow_complete_if_ready()
+        self._select_initial_tab()
         self.refresh_market()
 
     def _current_model_path(self) -> Path:
@@ -3798,8 +4978,8 @@ class App(ctk.CTk):
 
     def _load_settings_into_widgets(self) -> None:
         self.model_path_entry.insert(0, self.settings.data.get("model_path", DEFAULT_MODEL_PATH))
-        self.product_id_entry.insert(0, self.settings.data.get("product_id", "ETH-PERP"))
-        self.reference_product_entry.insert(0, self.settings.data.get("reference_product_id", "ETH-USD"))
+        self._set_widget_text(self.product_id_entry, self.settings.data.get("product_id", "ETH-PERP"))
+        self._set_widget_text(self.reference_product_entry, self.settings.data.get("reference_product_id", "ETH-USD"))
         self.refresh_entry.insert(0, str(self.settings.data.get("refresh_seconds", 25)))
         self.tf_primary_entry.insert(0, str(self.settings.data.get("timeframe_minutes", 15)))
         self.tf_secondary_entry.insert(0, str(self.settings.data.get("secondary_minutes", 5)))
@@ -3820,24 +5000,35 @@ class App(ctk.CTk):
             (self.cloud_mode_switch, "chart_show_ribbon_cloud"),
             (self.quant_panel_switch, "chart_show_quantum_panel"),
             (self.ema233_switch, "chart_show_ema233"),
+            (self.side_tray_switch, "side_tray_hidden"),
         ]:
             if self.settings.data.get(key, False):
                 switch.select()
+        cached = self.product_store.load_index()
+        if cached:
+            self._refresh_product_dropdowns_from_products(cached)
+        else:
+            self._refresh_product_dropdowns_from_products([])
         self._append_settings_status(self._describe_model_state())
         self._sync_setup_widgets_from_settings_widgets()
+        self._sync_market_dropdown_values()
         self._update_vault_security_ui()
+        if hasattr(self, "chart"):
+            self.chart.set_active_timeframe(int(self.settings.data.get("timeframe_minutes", 15)))
         self._select_initial_tab()
 
     def unlock_secrets(self) -> None:
         self.ensure_secrets_unlocked()
 
     def save_settings_action(self) -> None:
-        self.settings.data["product_id"] = self.product_id_entry.get().strip() or "ETH-PERP"
-        self.settings.data["reference_product_id"] = self.reference_product_entry.get().strip() or "ETH-USD"
+        self.settings.data["product_id"] = self._extract_product_id_from_widget(self.product_id_entry, "ETH-PERP")
+        self.settings.data["reference_product_id"] = self._extract_product_id_from_widget(self.reference_product_entry, "ETH-USD")
         self.settings.data["refresh_seconds"] = max(5, int(safe_float(self.refresh_entry.get(), 25)))
         self.settings.data["timeframe_minutes"] = max(1, int(safe_float(self.tf_primary_entry.get(), 15)))
         self.settings.data["secondary_minutes"] = max(1, int(safe_float(self.tf_secondary_entry.get(), 5)))
-        self.settings.data["tertiary_minutes"] = max(5, int(safe_float(self.tf_tertiary_entry.get(), 60)))
+        self.settings.data["tertiary_minutes"] = max(1, int(safe_float(self.tf_tertiary_entry.get(), 60)))
+        if hasattr(self, "chart"):
+            self.chart.set_active_timeframe(int(self.settings.data["timeframe_minutes"]))
         self.settings.data["bars"] = max(120, int(safe_float(self.bars_entry.get(), 320)))
         self.settings.data["default_order_quote_size"] = max(1.0, safe_float(self.default_quote_size_entry.get(), 25.0))
         self.settings.data["default_order_leverage"] = max(1.0, safe_float(self.default_leverage_entry.get(), 3.0))
@@ -3857,11 +5048,18 @@ class App(ctk.CTk):
             (self.cloud_mode_switch, "chart_show_ribbon_cloud"),
             (self.quant_panel_switch, "chart_show_quantum_panel"),
             (self.ema233_switch, "chart_show_ema233"),
+            (self.side_tray_switch, "side_tray_hidden"),
         ]:
             self.settings.data[key] = bool(switch.get())
 
-        api_key = self.coinbase_api_key_entry.get().strip()
-        private_key = self._get_private_key_value()
+        self.side_tray_hidden = bool(self.settings.data.get("side_tray_hidden", False))
+        self._apply_side_tray_state(persist=False)
+
+        raw_api_key = self.coinbase_api_key_entry.get().strip()
+        raw_private_key = self._get_private_key_value()
+        api_key, private_key, credential_notes = CoinbaseAdvancedClient.extract_coinbase_credentials(raw_api_key, raw_private_key)
+        for note in credential_notes:
+            self._append_settings_status(note)
         existing_vault = bool(self.settings.data.get("secrets"))
         has_secret_input = bool(api_key or private_key)
         if has_secret_input:
@@ -3903,6 +5101,7 @@ class App(ctk.CTk):
             self.vault_mode = mode
             self.vault_unlocked = True
             self._append_settings_status("Coinbase credentials sealed into the wrapped-master vault.")
+            self.refresh_products_action()
 
         self.settings.data["prompt_pack"] = merge_prompt_pack(self.prompt_pack.data)
         self.settings.save()
@@ -3910,8 +5109,34 @@ class App(ctk.CTk):
         self._clear_vault_password_inputs()
         self._append_settings_status(f"Settings saved. {self._describe_model_state()}")
         self._sync_setup_widgets_from_settings_widgets()
+        self._sync_market_dropdown_values()
         self._update_vault_security_ui()
         messagebox.showinfo("Saved", "Settings updated.")
+
+    @staticmethod
+    def _neighbor_timeframes(primary_minutes: int) -> Tuple[int, int]:
+        primary = max(1, int(primary_minutes))
+        choices = sorted(set(SUPPORTED_TIMEFRAME_MINUTES + tuple(ADVANCED_GRANULARITY_MAP.keys())))
+        lower = max([m for m in choices if m < primary], default=primary)
+        higher = min([m for m in choices if m > primary], default=primary)
+        return lower, higher
+
+    def set_primary_timeframe(self, minutes: int) -> None:
+        primary = max(1, int(minutes))
+        lower, higher = self._neighbor_timeframes(primary)
+        self.settings.data["timeframe_minutes"] = primary
+        self.settings.data["secondary_minutes"] = lower
+        self.settings.data["tertiary_minutes"] = higher
+        self.settings.save()
+        for name, value in (("tf_primary_entry", primary), ("tf_secondary_entry", lower), ("tf_tertiary_entry", higher)):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                self._set_widget_text(widget, value)
+        if hasattr(self, "chart"):
+            self.chart.set_active_timeframe(primary)
+        label = TIMEFRAME_LABEL_BY_MINUTE.get(primary, f"{primary}m")
+        self._append_settings_status(f"Candle timeframe set to {label}. Refreshing chart...")
+        self.refresh_market(force=True)
 
     def _load_market_frames(self, product_id: str, timeframes: List[int], bars: int) -> Tuple[Dict[int, pd.DataFrame], Dict[int, str]]:
         frames: Dict[int, pd.DataFrame] = {}
@@ -3944,33 +5169,42 @@ class App(ctk.CTk):
         self.refresh_market()
         self.after(max(5, int(self.settings.data.get("refresh_seconds", 30))) * 1000, self._schedule_refresh)
 
-    def refresh_market(self) -> None:
-        if self._refreshing:
+    def refresh_market(self, *, force: bool = False) -> None:
+        if self._refreshing and not force:
             return
+        self._refresh_token += 1
+        refresh_token = self._refresh_token
+        bars = int(self.settings.data.get("bars", 320))
+        timeframes = sorted(
+            {
+                int(self.settings.data.get("secondary_minutes", 5)),
+                int(self.settings.data.get("timeframe_minutes", 15)),
+                int(self.settings.data.get("tertiary_minutes", 60)),
+            }
+        )
+        product_id = sanitize_product_id(self.settings.data.get("product_id"), default="ETH-PERP")
+        reference_product_id = sanitize_product_id(self.settings.data.get("reference_product_id"), default="ETH-USD")
         self._refreshing = True
-        self._append_settings_status("Refreshing Coinbase market data...")
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        self._append_settings_status(f"Refreshing Coinbase market data for {product_id} / ref {reference_product_id}...")
+        threading.Thread(target=self._refresh_worker, args=(refresh_token, product_id, reference_product_id, timeframes, bars), daemon=True).start()
 
-    def _refresh_worker(self) -> None:
+    def _refresh_worker(self, refresh_token: int, product_id: str, reference_product_id: str, timeframes: List[int], bars: int) -> None:
         try:
-            bars = int(self.settings.data.get("bars", 320))
-            timeframes = sorted(
-                {
-                    int(self.settings.data.get("secondary_minutes", 5)),
-                    int(self.settings.data.get("timeframe_minutes", 15)),
-                    int(self.settings.data.get("tertiary_minutes", 60)),
-                }
-            )
-            product_id = self.settings.data["product_id"]
-            reference_product_id = self.settings.data["reference_product_id"]
             frames, frame_errors = self._load_market_frames(product_id, timeframes, bars)
             refs, ref_errors = self._load_market_frames(reference_product_id, timeframes, bars)
+            if all(df.empty for df in refs.values()) and any(not df.empty for df in frames.values()):
+                refs = {minutes: df.copy() for minutes, df in frames.items()}
+                ref_errors = {}
             surface = None
             if any(not df.empty for df in frames.values()):
                 self.last_market_error = ""
-                primary_minutes = min(timeframes, key=lambda x: abs(x - 15))
+                configured_primary = int(self.settings.data.get("timeframe_minutes", 15))
+                if configured_primary in frames and not frames[configured_primary].empty:
+                    primary_minutes = configured_primary
+                else:
+                    primary_minutes = min((m for m in timeframes if not frames.get(m, pd.DataFrame()).empty), key=lambda x: abs(x - configured_primary))
                 basis_pct = 0.0
-                joined = pd.concat([frames[primary_minutes]["Close"].rename("perp"), refs[primary_minutes]["Close"].rename("spot")], axis=1, join="inner").dropna()
+                joined = pd.concat([frames[primary_minutes]["Close"].rename("perp"), refs.get(primary_minutes, frames[primary_minutes])["Close"].rename("spot")], axis=1, join="inner").dropna()
                 if not joined.empty:
                     basis_pct = safe_float(((joined.iloc[-1]["perp"] - joined.iloc[-1]["spot"]) / joined.iloc[-1]["spot"]))
                 sensor = self.sensor.sample(frames[primary_minutes], basis_pct) if self.settings.data.get("pennylane_sensor_enabled", True) else None
@@ -3983,19 +5217,36 @@ class App(ctk.CTk):
                 if reference_product_id != product_id:
                     details.append(self._summarize_market_frames(reference_product_id, refs, ref_errors))
                 self.last_market_error = " || ".join(detail for detail in details if detail)
-            self.after(0, lambda: self._apply_market(frames, refs, surface))
+            def apply_if_current() -> None:
+                if refresh_token != self._refresh_token:
+                    return
+                if sanitize_product_id(self.settings.data.get("product_id"), default="") != product_id:
+                    return
+                self._apply_market(frames, refs, surface)
+            self.after(0, apply_if_current)
         except Exception as exc:
             self.last_market_error = str(exc)
             self.after(0, lambda e=str(exc): self._append_settings_status(f"Market refresh failed: {e}"))
         finally:
-            self._refreshing = False
+            if refresh_token == self._refresh_token:
+                self._refreshing = False
 
     def _apply_market(self, frames: Dict[int, pd.DataFrame], refs: Dict[int, pd.DataFrame], surface: Optional[SurfaceState]) -> None:
         self.frames = frames
         self.reference_frames = refs
         self.surface = surface
         primary = int(self.settings.data.get("timeframe_minutes", 15))
-        self.chart.draw(frames.get(primary, pd.DataFrame()), refs.get(primary, pd.DataFrame()), surface, self.settings.data)
+        display_primary = primary
+        if frames.get(display_primary, pd.DataFrame()).empty:
+            loaded = [m for m, df in frames.items() if not df.empty]
+            if loaded:
+                display_primary = min(loaded, key=lambda m: abs(m - primary))
+                self._append_settings_status(
+                    f"Selected {TIMEFRAME_LABEL_BY_MINUTE.get(primary, str(primary) + 'm')} candles were unavailable; "
+                    f"displaying nearest loaded {TIMEFRAME_LABEL_BY_MINUTE.get(display_primary, str(display_primary) + 'm')} candles."
+                )
+        self.chart.set_active_timeframe(display_primary)
+        self.chart.draw(frames.get(display_primary, pd.DataFrame()), refs.get(display_primary, pd.DataFrame()), surface, self.settings.data)
         if surface is None:
             self._set_summary(
                 "Market data is not loaded yet.\n"
@@ -4008,8 +5259,15 @@ class App(ctk.CTk):
             self._refresh_startup_checklist()
             return
 
+        product_id = sanitize_product_id(self.settings.data.get("product_id"), default="ETH-PERP")
+        price_tile = self.tiles.get("ETH-PERP Price")
+        if price_tile is not None:
+            try:
+                price_tile.title_label.configure(text=f"{product_id} Price")
+                price_tile.value.configure(text=human_money(surface.price))
+            except Exception:
+                pass
         tile_values = {
-            "ETH-PERP Price": human_money(surface.price),
             "Dominant Signal": surface.dominant_signal.replace("_", " "),
             "Regime": surface.regime,
             "Confidence": human_pct(surface.confidence_level),
@@ -4031,7 +5289,7 @@ class App(ctk.CTk):
         )
         memory_line = "none" if not surface.memory_hits else " | ".join(f"{m.signal}/{m.regime}/{m.theory}({m.score:+.2f})" for m in surface.memory_hits[:3])
         self._set_summary(
-            "Advanced ETH-PERP intelligence surface\n"
+            f"Advanced {product_id} intelligence surface\n"
             f"- {surface.summary}\n"
             f"- Timeframe lattice: {tf_lines}\n"
             f"- Memory analogs: {memory_line}\n"
@@ -4059,7 +5317,7 @@ class App(ctk.CTk):
         self.memory_box.insert("1.0", "\n".join(f"- {m.score:+.2f} · {m.signal} · {m.regime} · {m.theory}\n  {m.summary}" for m in surface.memory_hits) or "No similar in-session states surfaced yet.")
 
         self._append_settings_status(
-            f"Market refresh ok. {self.settings.data.get('product_id', 'ETH-PERP')} price {surface.price:,.2f} | signal {surface.dominant_signal} | regime {surface.regime}"
+            f"Market refresh ok. {product_id} price {surface.price:,.2f} | signal {surface.dominant_signal} | regime {surface.regime}"
         )
         self._refresh_startup_checklist()
         self._run_autonomy(surface)
@@ -4078,6 +5336,45 @@ class App(ctk.CTk):
         self.autonomy_cooldown.append(now)
         self.trade_log.insert("end", f"[AUTO PAPER] {surface.suggested_action} · size {human_money(surface.suggested_notional_usd)} · edge {surface.signal_score:+.2f} · theory {surface.theory_packet.dominant_theory}\n")
         self.trade_log.see("end")
+
+    def ask_trade_ai(self, mode: str) -> None:
+        prompts = {
+            "market_read": "Produce a concise AI market read for the active product. Separate evidence, inference, contradiction, and no-trade reasons.",
+            "risk_audit": "Audit the active market packet like a risk governor. Emphasize what can fail, candle/data weakness, liquidity, leverage risk, and reasons to stay flat.",
+            "execution_plan": "Create a conditional execution plan for the active product: trigger, invalidation, scale logic, cancel conditions, and a no-trade checklist. Do not promise profit.",
+        }
+        user_text = prompts.get(mode, prompts["market_read"])
+        product_id = sanitize_product_id(self.settings.data.get("product_id"), default="ETH-PERP")
+        if hasattr(self, "trade_log"):
+            self.trade_log.insert("end", f"\n[AI REQUEST] {product_id} · {mode.replace('_', ' ').title()}\n")
+            self.trade_log.see("end")
+        threading.Thread(target=self._trade_ai_worker, args=(user_text,), daemon=True).start()
+
+    def _trade_ai_worker(self, user_text: str) -> None:
+        try:
+            if self.surface is None:
+                reply = "Market packet unavailable. Refresh market data first."
+            elif self.gemma.available:
+                prompt = self.prompt_architect.build_gemma4_prompt(self.surface, self.frames, self.reference_frames, user_text)
+                reply = self.gemma.generate_text(
+                    prompt,
+                    temperature=float(self.settings.data.get("model_temperature", 0.20)),
+                    top_p=float(self.settings.data.get("model_top_p", 0.90)),
+                    max_tokens=min(1200, int(self.settings.data.get("model_max_tokens", 1400))),
+                )
+            else:
+                reply = (
+                    f"Gemma runtime unavailable at {self.gemma.model_path}. "
+                    "Using local signal-lab fallback.\n\n"
+                    f"{self._fallback_commentary(user_text)}"
+                )
+        except Exception as exc:
+            reply = f"AI trading reply failed; using local signal-lab fallback.\n\n{self._fallback_commentary(user_text)}\n\nRuntime detail: {exc}"
+        def append() -> None:
+            if hasattr(self, "trade_log"):
+                self.trade_log.insert("end", f"[AI REPLY]\n{reply}\n")
+                self.trade_log.see("end")
+        self.after(0, append)
 
     def ask_model(self) -> None:
         user_text = self.chat_input.get("1.0", "end").strip()
@@ -4186,7 +5483,10 @@ class App(ctk.CTk):
         side = self.order_side.get().strip().upper()
         leverage = self.order_leverage.get().strip()
         margin_type = self.margin_type_combo.get().strip()
-        product_id = self.settings.data.get("product_id", "ETH-PERP")
+        product_id = self._extract_product_id_from_widget(getattr(self, "trade_product_combo", None), self.settings.data.get("product_id", "ETH-PERP"))
+        self.settings.data["product_id"] = product_id
+        self.settings.save()
+        self._sync_market_dropdown_values()
 
         def worker():
             try:
@@ -4212,7 +5512,10 @@ class App(ctk.CTk):
         side = self.order_side.get().strip().upper()
         leverage = self.order_leverage.get().strip()
         margin_type = self.margin_type_combo.get().strip()
-        product_id = self.settings.data.get("product_id", "ETH-PERP")
+        product_id = self._extract_product_id_from_widget(getattr(self, "trade_product_combo", None), self.settings.data.get("product_id", "ETH-PERP"))
+        self.settings.data["product_id"] = product_id
+        self.settings.save()
+        self._sync_market_dropdown_values()
         preview_id = self.last_preview_id
 
         def worker():
