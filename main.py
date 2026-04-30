@@ -81,12 +81,13 @@ DEFAULT_MODEL_PATH = str(MODELS_DIR / MODEL_FILE)
 # Gemma 4 LiteRT community builds commonly expose a 4096-token text context.
 # Keep input safely below that boundary so market packets do not crash generation.
 LITERT_CONTEXT_TOKENS = 4096
-LITERT_SAFE_INPUT_TOKENS = 3000
-LITERT_SAFE_OUTPUT_TOKENS = 1024
-LITERT_REPLY_CHUNK_TOKENS = 896
-LITERT_MAX_REPLY_CHUNKS = 4
+LITERT_SAFE_INPUT_TOKENS = 1700
+LITERT_SAFE_OUTPUT_TOKENS = 768
+LITERT_REPLY_CHUNK_TOKENS = 512
+LITERT_MAX_REPLY_CHUNKS = 6
+LITERT_OVERLAP_CHARS = 950
 LITERT_CONTINUE_MARKER = "[[CONTINUE]]"
-LITERT_CHAR_BUDGET = 9000
+LITERT_CHAR_BUDGET = 3600
 # Keep heavy LiteRT inference outside Tkinter's process. Some LiteRT wheels
 # hold the GIL during generation, which makes Tkinter look frozen even when
 # called from a Python thread.
@@ -2448,13 +2449,13 @@ def approximate_litert_tokens(text: str) -> int:
     # Conservative approximation for English + JSON-style market packets.
     # It intentionally overestimates so we stay under LiteRT's hard context limit.
     clean = str(text or "")
-    return max(1, int(math.ceil(len(clean) / 3.0)))
+    return max(1, int(math.ceil(len(clean) / 2.0)))
 
 
 def trim_for_litert_context(text: Any, *, max_input_tokens: int = LITERT_SAFE_INPUT_TOKENS) -> str:
     clean = sanitize_structured_text(text, max_chars=50000)
     safe_tokens = max(512, min(int(max_input_tokens), LITERT_CONTEXT_TOKENS - 512))
-    char_budget = min(LITERT_CHAR_BUDGET, max(1600, safe_tokens * 3))
+    char_budget = min(LITERT_CHAR_BUDGET, max(1200, safe_tokens * 2))
     if len(clean) <= char_budget:
         return clean
 
@@ -2464,8 +2465,8 @@ def trim_for_litert_context(text: Any, *, max_input_tokens: int = LITERT_SAFE_IN
     )
     # Preserve the system framing at the front and the actual request / output
     # instructions at the end. The bulky MARKET_PACKET lives in the middle.
-    head_chars = min(2600, max(900, char_budget // 3))
-    tail_chars = max(900, char_budget - head_chars - len(marker))
+    head_chars = min(1100, max(500, char_budget // 3))
+    tail_chars = max(500, char_budget - head_chars - len(marker))
     return (clean[:head_chars].rstrip() + marker + clean[-tail_chars:].lstrip()).strip()
 
 
@@ -2593,12 +2594,27 @@ def _run_litert_text_worker_cli(input_path: str, output_path: str) -> int:
             pass
         payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
         runtime = Gemma4Runtime(str(payload.get("model_path") or DEFAULT_MODEL_PATH))
-        text = runtime.generate_text(
-            str(payload.get("prompt") or ""),
-            temperature=float(payload.get("temperature", 0.20)),
-            top_p=float(payload.get("top_p", 0.90)),
-            max_tokens=clamp_litert_output_tokens(payload.get("max_tokens", LITERT_SAFE_OUTPUT_TOKENS)),
-        )
+        base_prompt = str(payload.get("prompt") or "")
+        output_tokens = clamp_litert_output_tokens(payload.get("max_tokens", LITERT_SAFE_OUTPUT_TOKENS))
+        last_error = ""
+        text = ""
+        # Tokenizers for some LiteRT builds are much less compact than a char
+        # estimate. Retry with smaller prompts instead of failing the GUI action.
+        for input_budget in (1500, 1200, 900, 650):
+            try:
+                text = runtime.generate_text(
+                    trim_for_litert_context(base_prompt, max_input_tokens=input_budget),
+                    temperature=float(payload.get("temperature", 0.20)),
+                    top_p=float(payload.get("top_p", 0.90)),
+                    max_tokens=output_tokens,
+                )
+                break
+            except Exception as retry_exc:
+                last_error = str(retry_exc)
+                if "Input token ids are too long" not in last_error and "maximum number of tokens" not in last_error:
+                    raise
+        if not text:
+            raise RuntimeError(last_error or "LiteRT returned no text after prompt budget retries.")
         Path(output_path).write_text(json.dumps({"ok": True, "text": text}), encoding="utf-8")
         return 0
     except Exception as exc:
@@ -2616,7 +2632,7 @@ def _strip_continue_marker(text: str) -> Tuple[str, bool]:
     requested = False
     for marker in markers:
         idx = upper.rfind(marker.upper())
-        if idx >= 0 and len(clean) - idx <= 80:
+        if idx >= 0 and len(clean) - idx <= 120:
             clean = clean[:idx].rstrip()
             requested = True
             break
@@ -2627,12 +2643,13 @@ def _looks_cut_off(text: str, *, output_tokens: int) -> bool:
     clean = sanitize_structured_text(text, max_chars=80000).rstrip()
     if not clean:
         return False
-    if approximate_litert_tokens(clean) >= int(output_tokens) * 0.86:
+    if approximate_litert_tokens(clean) >= int(output_tokens) * 0.82:
         return True
-    tail = clean[-160:].strip()
+    tail = clean[-220:].strip()
     if not tail:
         return False
-    # Common hard cut symptom: ends mid-word or mid-heading instead of with a closing mark.
+    if tail.endswith(":") or tail.endswith(("-", "•", "*")):
+        return True
     if tail[-1] not in ".!?)]}\"'`":
         return True
     if clean.count("```") % 2 == 1:
@@ -2640,27 +2657,103 @@ def _looks_cut_off(text: str, *, output_tokens: int) -> bool:
     return False
 
 
-def _build_chunked_initial_prompt(prompt: str) -> str:
-    return trim_for_litert_context(
-        sanitize_structured_text(prompt, max_chars=50000)
-        + "\n\nOUTPUT CONTROL:\n"
-        + "Write a complete, useful answer. If the answer cannot fit in this reply, "
-        + f"end the reply with exactly {LITERT_CONTINUE_MARKER}. Do not use that marker if the answer is complete."
+def _reply_completion_score(text: str) -> float:
+    clean = sanitize_structured_text(text, max_chars=120000).lower()
+    if not clean:
+        return 0.0
+    checkpoints = (
+        "thesis", "long", "short", "flat", "wait", "income", "invalidation",
+        "risk", "confidence", "change", "data quality", "regime",
     )
+    hits = sum(1 for item in checkpoints if item in clean)
+    return min(1.0, hits / 8.0)
+
+
+def _tail_sentence_window(text: str, *, max_chars: int = LITERT_OVERLAP_CHARS) -> str:
+    clean = sanitize_structured_text(text, max_chars=120000).strip()
+    if len(clean) <= max_chars:
+        return clean
+    tail = clean[-max_chars:]
+    boundary_candidates = [tail.find("\n\n"), tail.find("\n#"), tail.find(". "), tail.find("! "), tail.find("? ")]
+    boundary_candidates = [idx for idx in boundary_candidates if idx > 80]
+    if boundary_candidates:
+        return tail[min(boundary_candidates):].lstrip()
+    return tail.lstrip()
+
+
+def _build_chunked_initial_prompt(prompt: str) -> str:
+    controlled = (
+        sanitize_structured_text(prompt, max_chars=22000)
+        + "\n\nOUTPUT CONTROL:\n"
+        + "Write a complete memo in compact sections. Prefer concise bullets over long prose. "
+        + "When near the limit, stop only at a clean sentence boundary and end with exactly "
+        + f"{LITERT_CONTINUE_MARKER}. Do not use that marker if every requested section is complete."
+    )
+    return trim_for_litert_context(controlled, max_input_tokens=1350)
+
+
+def _missing_reply_surface(combined_reply: str) -> str:
+    clean = sanitize_structured_text(combined_reply, max_chars=120000).lower()
+    required = [
+        ("Thesis", ("thesis",)),
+        ("Long case", ("long case", "long:")),
+        ("Short case", ("short case", "short:")),
+        ("Flat / wait case", ("flat", "wait case")),
+        ("Income-generation research rail", ("income", "maker", "carry")),
+        ("Invalidations", ("invalidation", "invalidations")),
+        ("Risk box", ("risk box", "risk")),
+        ("Confidence", ("confidence",)),
+        ("What would change the view", ("change", "change your mind", "change the view")),
+    ]
+    missing = [label for label, needles in required if not any(needle in clean for needle in needles)]
+    return ", ".join(missing) if missing else "None obvious; continue only unfinished thought and close cleanly."
 
 
 def _build_continuation_prompt(original_prompt: str, combined_reply: str, chunk_index: int) -> str:
-    previous_tail = sanitize_structured_text(combined_reply, max_chars=7000)[-5200:]
+    overlap = _tail_sentence_window(combined_reply, max_chars=LITERT_OVERLAP_CHARS)
+    original_tail = sanitize_structured_text(original_prompt, max_chars=2400)[-1600:]
+    missing = _missing_reply_surface(combined_reply)
     continuation = (
-        "\n\nCONTINUATION TASK:\n"
-        "You are continuing the same market memo. Do not restart and do not repeat completed sections. "
-        "Continue exactly from where the previous answer stopped. Finish any missing headings, invalidations, risk box, confidence, and change-of-mind section. "
-        f"If more space is still needed, end with exactly {LITERT_CONTINUE_MARKER}.\n\n"
-        f"PREVIOUS ANSWER TAIL:\n{previous_tail}\n\n"
-        f"CONTINUE AS PART {chunk_index + 1}:"
+        "CONTINUATION TASK - OVERLAP CHUNKING SURFACE:\n"
+        "Continue the SAME answer. Do not restart the memo. Do not summarize the prior answer. "
+        "The OVERLAP below is already printed; use it only to resume smoothly, and do not repeat it unless a few words are needed for grammar. "
+        "Start exactly after the overlap, at the next missing sentence/section. Maintain the same formatting. "
+        "Finish any missing surfaces listed below, then close the answer cleanly. "
+        f"If more space is still needed, stop at a sentence boundary and end with exactly {LITERT_CONTINUE_MARKER}.\n\n"
+        f"MISSING / UNFINISHED SURFACES:\n{missing}\n\n"
+        f"REQUEST / PACKET TAIL FOR CONTEXT:\n{original_tail}\n\n"
+        f"OVERLAP - DO NOT REPEAT VERBATIM:\n{overlap}\n\n"
+        f"CONTINUATION PART {chunk_index + 1}:"
     )
-    return trim_for_litert_context(sanitize_structured_text(original_prompt, max_chars=50000) + continuation)
+    return trim_for_litert_context(continuation, max_input_tokens=1050)
 
+
+def _normalize_for_overlap(value: str) -> str:
+    return re.sub(r"\s+", " ", sanitize_structured_text(value, max_chars=80000)).strip().lower()
+
+
+def _merge_continuation_chunk(existing: str, new_chunk: str) -> str:
+    """Merge continuation chunks while trimming repeated overlap at the seam."""
+    left = sanitize_structured_text(existing, max_chars=120000).rstrip()
+    right = sanitize_structured_text(new_chunk, max_chars=80000).lstrip()
+    if not left:
+        return right.strip()
+    if not right:
+        return left.strip()
+    max_check = min(1200, len(left), len(right))
+    best = 0
+    for size in range(max_check, 40, -1):
+        if _normalize_for_overlap(left[-size:]) == _normalize_for_overlap(right[:size]):
+            best = size
+            break
+    if best:
+        right = right[best:].lstrip()
+    left_tail_norm = _normalize_for_overlap(left[-1800:])
+    paragraphs = re.split(r"(\n\s*\n)", right, maxsplit=2)
+    first_para = paragraphs[0].strip() if paragraphs else ""
+    if first_para and _normalize_for_overlap(first_para) in left_tail_norm:
+        right = "".join(paragraphs[1:]).lstrip() if len(paragraphs) > 1 else ""
+    return (left + "\n\n" + right).strip()
 
 def generate_text_litert_chunked(
     *,
@@ -2672,12 +2765,13 @@ def generate_text_litert_chunked(
     max_chunks: int = LITERT_MAX_REPLY_CHUNKS,
     status_callback: Optional[Any] = None,
 ) -> str:
-    """Generate long LiteRT answers as bounded continuation chunks."""
-    output_tokens = max(256, min(clamp_litert_output_tokens(max_tokens), LITERT_REPLY_CHUNK_TOKENS))
-    chunks: List[str] = []
-    original_prompt = trim_for_litert_context(prompt)
+    """Generate long LiteRT answers as overlapping continuation chunks."""
+    output_tokens = max(320, min(clamp_litert_output_tokens(max_tokens), LITERT_REPLY_CHUNK_TOKENS))
+    original_prompt = trim_for_litert_context(prompt, max_input_tokens=1350)
     current_prompt = _build_chunked_initial_prompt(original_prompt)
     total = max(1, int(max_chunks))
+    combined = ""
+    stopped_at_limit = False
     for chunk_index in range(total):
         if status_callback:
             try:
@@ -2693,26 +2787,25 @@ def generate_text_litert_chunked(
         )
         cleaned, requested_continue = _strip_continue_marker(raw)
         if cleaned:
-            chunks.append(cleaned)
-        combined = "\n\n".join(chunks).strip()
+            combined = _merge_continuation_chunk(combined, cleaned)
         needs_more = requested_continue or _looks_cut_off(cleaned or raw, output_tokens=output_tokens)
+        if _reply_completion_score(combined) < 0.74 and chunk_index == 0:
+            needs_more = True
         if status_callback:
             try:
-                status_callback(chunk_index + 1, total, "received")
+                status_callback(chunk_index + 1, total, "merged")
             except Exception:
                 pass
-        if not needs_more or chunk_index >= total - 1:
+        if not needs_more:
+            break
+        if chunk_index >= total - 1:
+            stopped_at_limit = True
             break
         current_prompt = _build_continuation_prompt(original_prompt, combined, chunk_index + 1)
-    final = ""
-    for idx, part in enumerate(chunks, start=1):
-        if len(chunks) > 1:
-            final += f"Part {idx}/{len(chunks)}\n{part.strip()}\n\n"
-        else:
-            final += part.strip()
-    if len(chunks) >= total and _looks_cut_off(chunks[-1], output_tokens=output_tokens):
-        final = final.rstrip() + "\n\n[Stopped after the configured chunk limit. Increase LITERT_MAX_REPLY_CHUNKS if you want even longer replies.]"
-    return final.strip() or "LiteRT returned an empty chunked response."
+    final = combined.strip()
+    if stopped_at_limit and _looks_cut_off(final, output_tokens=output_tokens):
+        final += "\n\n[Stopped after the configured continuation limit. Increase LITERT_MAX_REPLY_CHUNKS for longer answers.]"
+    return final or "LiteRT returned an empty chunked response."
 
 
 class Gemma4Runtime:
@@ -6090,10 +6183,35 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
 
+
 def main() -> None:
     app = App()
     app.mainloop()
 
 
+def _maybe_run_litert_worker_from_argv() -> bool:
+    """Run the hidden LiteRT child worker instead of launching the Tk app.
+
+    The GUI calls this same Python file in a subprocess for local model
+    generation. Without this argv gate, the child process executes main() and
+    opens a second copy of the full app every time a prompt is sent, which
+    looks like the app rebooting.
+    """
+    try:
+        if len(sys.argv) >= 4 and sys.argv[1] == LITERT_WORKER_FLAG:
+            raise SystemExit(_run_litert_text_worker_cli(sys.argv[2], sys.argv[3]))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        try:
+            if len(sys.argv) >= 4:
+                Path(sys.argv[3]).write_text(json.dumps({"ok": False, "error": str(exc)}), encoding="utf-8")
+        except Exception:
+            pass
+        raise SystemExit(1)
+    return False
+
+
 if __name__ == "__main__":
+    _maybe_run_litert_worker_from_argv()
     main()
