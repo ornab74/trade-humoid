@@ -62,7 +62,7 @@ except Exception:
     litert_lm = None
 
 try:
-    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 except Exception as exc:
@@ -96,6 +96,14 @@ LITERT_WORKER_FLAG = "--litert-text-worker"
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 COINBASE_PUBLIC_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 COINBASE_AUTH_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}/candles"
+COINBASE_AUTH_ADVANCED_TICKER = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}/ticker"
+COINBASE_PUBLIC_ADVANCED_TICKER = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/ticker"
+COINBASE_AUTH_ADVANCED_PRODUCT = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}"
+COINBASE_PUBLIC_ADVANCED_PRODUCT = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}"
+COINBASE_AUTH_ADVANCED_PRODUCT_BOOK = "https://api.coinbase.com/api/v3/brokerage/product_book"
+COINBASE_PUBLIC_ADVANCED_PRODUCT_BOOK = "https://api.coinbase.com/api/v3/brokerage/market/product_book"
+COINBASE_AUTH_ADVANCED_BEST_BID_ASK = "https://api.coinbase.com/api/v3/brokerage/best_bid_ask"
+COINBASE_PUBLIC_ADVANCED_BEST_BID_ASK = "https://api.coinbase.com/api/v3/brokerage/market/best_bid_ask"
 COINBASE_PUBLIC_PRODUCTS = "https://api.coinbase.com/api/v3/brokerage/market/products"
 COINBASE_AUTH_PRODUCTS_PATH = "/products"
 COINBASE_ADVANCED_BASE = "https://api.coinbase.com/api/v3/brokerage"
@@ -1244,6 +1252,226 @@ class CoinbaseAdvancedClient:
         except Exception:
             return pd.DataFrame()
 
+
+
+    @staticmethod
+    def _extract_prices_from_payload(raw: Any) -> Tuple[List[float], float]:
+        """Extract usable prices from Coinbase ticker/book/product/best-bid-ask shapes."""
+        prices: List[float] = []
+        volume = 0.0
+
+        def add_price(value: Any) -> None:
+            val = pd.to_numeric(value, errors="coerce")
+            if not pd.isna(val):
+                prices.append(float(val))
+
+        def walk(value: Any, depth: int = 0) -> None:
+            nonlocal volume
+            if depth > 4:
+                return
+            if isinstance(value, dict):
+                for key in (
+                    "price", "mid_market_price", "mark_price", "index_price", "last_price",
+                    "best_bid", "best_ask", "bid", "ask", "pricebook_mid_market_price",
+                    "base_increment", "quote_increment",
+                ):
+                    if key in value:
+                        add_price(value.get(key))
+                for key in ("volume", "volume_24h", "quote_volume", "base_volume"):
+                    val = pd.to_numeric(value.get(key), errors="coerce")
+                    if not pd.isna(val):
+                        volume = max(volume, float(val))
+                # Product book commonly uses pricebook: {bids: [{price,size}], asks:[...]}
+                for side_key in ("bids", "asks"):
+                    levels = value.get(side_key)
+                    if isinstance(levels, list) and levels:
+                        level = levels[0]
+                        if isinstance(level, dict):
+                            add_price(level.get("price"))
+                        elif isinstance(level, (list, tuple)) and level:
+                            add_price(level[0])
+                for nested_key in ("pricebook", "product", "product_details", "best_bid_ask", "future_product_details"):
+                    if nested_key in value:
+                        walk(value.get(nested_key), depth + 1)
+                for key, val in value.items():
+                    if key in {"products", "pricebooks", "best_bid_asks"}:
+                        walk(val, depth + 1)
+            elif isinstance(value, list):
+                for item in value[:8]:
+                    walk(item, depth + 1)
+
+        walk(raw)
+        # de-duplicate while preserving order
+        clean: List[float] = []
+        for price in prices:
+            if math.isfinite(price) and price > 0 and price not in clean:
+                clean.append(price)
+        return clean, volume
+
+    @staticmethod
+    def _quote_to_frame(raw: Any, *, minutes: int, bars: int) -> pd.DataFrame:
+        prices, volume = CoinbaseAdvancedClient._extract_prices_from_payload(raw)
+        if not prices:
+            return pd.DataFrame()
+        px = prices[0]
+        low = min(prices)
+        high = max(prices)
+        now = pd.Timestamp.now(tz="UTC").floor(f"{max(1, int(minutes))}min").tz_convert(EASTERN_TZ)
+        return pd.DataFrame(
+            {"Open": [px], "High": [max(high, px)], "Low": [min(low, px)], "Close": [px], "Volume": [volume]},
+            index=[now],
+        )
+
+    @staticmethod
+    def _ticker_to_frame(raw: Any, *, minutes: int, bars: int) -> pd.DataFrame:
+        """Build OHLCV from Advanced Trade market trades, quote, book, or product snapshot.
+
+        Some valid Coinbase Advanced/CFM futures pages exist in the UI but return
+        an empty REST candle array for a selected history window. In that case,
+        keep the product alive in the UI by falling back to official Advanced
+        market-data endpoints: ticker/trades, best-bid-ask, product book, and
+        product detail. Trade-derived bars are preferred; quote-derived bars are
+        marked by low/zero volume and should be treated as degraded.
+        """
+        if not isinstance(raw, dict):
+            return pd.DataFrame()
+        trades = raw.get("trades") if isinstance(raw.get("trades"), list) else []
+        rows: List[Dict[str, Any]] = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            ts = pd.to_datetime(trade.get("time"), utc=True, errors="coerce")
+            price = pd.to_numeric(trade.get("price"), errors="coerce")
+            size = pd.to_numeric(trade.get("size"), errors="coerce")
+            if pd.isna(ts) or pd.isna(price):
+                continue
+            rows.append({"time": ts, "price": float(price), "size": 0.0 if pd.isna(size) else float(size)})
+        if rows:
+            tdf = pd.DataFrame(rows).sort_values("time").set_index("time")
+            rule = f"{max(1, int(minutes))}min"
+            out = tdf.resample(rule).agg({"price": ["first", "max", "min", "last"], "size": "sum"})
+            out.columns = ["Open", "High", "Low", "Close", "Volume"]
+            out = out.dropna(how="any")
+            out.index = out.index.tz_convert(EASTERN_TZ)
+            return out[["Open", "High", "Low", "Close", "Volume"]].tail(max(1, int(bars)))
+
+        return CoinbaseAdvancedClient._quote_to_frame(raw, minutes=minutes, bars=bars)
+
+    def _advanced_marketdata_fallback(self, product_id: str, minutes: int, bars: int, start_ts: int, end_ts: int) -> pd.DataFrame:
+        """Fallback for valid Advanced/CFM products whose candle endpoint is empty.
+
+        This intentionally uses only Coinbase Advanced Trade endpoints and the
+        user's existing CDP JWT key. It does not require or mention any separate
+        CDE/FairX key.
+        """
+        candidate = sanitize_product_id(product_id, default="")
+        if not candidate:
+            return pd.DataFrame()
+
+        limit = min(1000, max(50, int(bars) * 4))
+        attempts: List[Tuple[str, str, Dict[str, Any], bool, str]] = []
+
+        # Prefer authenticated current market trades without a start/end window:
+        # thin futures often have no trades in the exact requested candle window,
+        # but current ticker/book still proves the product is live.
+        if self.secrets and jwt is not None and not self._auth_disabled_error:
+            attempts.extend([
+                (COINBASE_AUTH_ADVANCED_TICKER.format(product_id=candidate), f"/products/{candidate}/ticker", {"limit": limit}, True, "auth ticker"),
+                (COINBASE_AUTH_ADVANCED_TICKER.format(product_id=candidate), f"/products/{candidate}/ticker", {"limit": limit, "start": str(int(start_ts)), "end": str(int(end_ts))}, True, "auth ticker window"),
+                (COINBASE_AUTH_ADVANCED_BEST_BID_ASK, "/best_bid_ask", {"product_ids": candidate}, True, "auth best bid/ask"),
+                (COINBASE_AUTH_ADVANCED_PRODUCT_BOOK, "/product_book", {"product_id": candidate, "limit": 1}, True, "auth product book"),
+                (COINBASE_AUTH_ADVANCED_PRODUCT.format(product_id=candidate), f"/products/{candidate}", {}, True, "auth product"),
+            ])
+
+        attempts.extend([
+            (COINBASE_PUBLIC_ADVANCED_TICKER.format(product_id=candidate), f"/market/products/{candidate}/ticker", {"limit": limit}, False, "public ticker"),
+            (COINBASE_PUBLIC_ADVANCED_TICKER.format(product_id=candidate), f"/market/products/{candidate}/ticker", {"limit": limit, "start": str(int(start_ts)), "end": str(int(end_ts))}, False, "public ticker window"),
+            (COINBASE_PUBLIC_ADVANCED_BEST_BID_ASK, "/market/best_bid_ask", {"product_ids": candidate}, False, "public best bid/ask"),
+            (COINBASE_PUBLIC_ADVANCED_PRODUCT_BOOK, "/market/product_book", {"product_id": candidate, "limit": 1}, False, "public product book"),
+            (COINBASE_PUBLIC_ADVANCED_PRODUCT.format(product_id=candidate), f"/market/products/{candidate}", {}, False, "public product"),
+        ])
+
+        for url, path, params, is_auth, _label in attempts:
+            try:
+                headers = {"Cache-Control": "no-cache"}
+                if is_auth:
+                    headers["Authorization"] = f"Bearer {self._jwt_token('GET', path)}"
+                r = self.http.get(url, params=params, headers=headers)
+                r.raise_for_status()
+                payload = r.json()
+                df = self._ticker_to_frame(payload, minutes=minutes, bars=bars)
+                if not df.empty:
+                    # Hydrate product metadata opportunistically from product endpoint responses.
+                    if isinstance(payload, dict):
+                        product_payload = payload.get("product") if isinstance(payload.get("product"), dict) else payload
+                        pid = sanitize_product_id(product_payload.get("product_id") if isinstance(product_payload, dict) else "", default="")
+                        if pid:
+                            self.product_metadata_by_id[pid] = product_payload
+                    return df
+            except Exception:
+                continue
+        return pd.DataFrame()
+
+    # Backward-compatible name used by older patched blocks.
+    def _advanced_ticker_fallback(self, product_id: str, minutes: int, bars: int, start_ts: int, end_ts: int) -> pd.DataFrame:
+        return self._advanced_marketdata_fallback(product_id, minutes, bars, start_ts, end_ts)
+
+    def _validate_or_discover_advanced_product(self, product_id: str) -> Tuple[List[str], List[str]]:
+        """Return exact/nearby Coinbase product ids, using product metadata when available.
+
+        Typed or pasted expiring futures symbols can be stale or normalized
+        differently than the trade UI. Before declaring an INVALID_ARGUMENT fatal,
+        try exact product lookup and then use already-loaded product metadata to
+        offer nearby unexpired products with the same root.
+        """
+        requested = sanitize_product_id(product_id, default="")
+        errors: List[str] = []
+        candidates = self._candidate_product_ids(requested)
+
+        if requested and requested.endswith("-CDE"):
+            root = requested.split("-", 1)[0]
+            # Add nearby products from the product cache/list, e.g. GOL-* or NOL-*.
+            for pid, meta in sorted(self.product_metadata_by_id.items()):
+                clean = sanitize_product_id(pid, default="")
+                if clean and clean.startswith(root + "-") and clean.endswith("-CDE") and clean not in candidates:
+                    candidates.append(clean)
+
+        # Exact product lookup validates UI-linked futures and also hydrates metadata.
+        for candidate in list(candidates):
+            for url, path, is_auth in (
+                (COINBASE_AUTH_ADVANCED_PRODUCT.format(product_id=candidate), f"/products/{candidate}", True),
+                (COINBASE_PUBLIC_ADVANCED_PRODUCT.format(product_id=candidate), f"/market/products/{candidate}", False),
+            ):
+                if is_auth and not (self.secrets and jwt is not None and not self._auth_disabled_error):
+                    continue
+                try:
+                    headers = {"Cache-Control": "no-cache"}
+                    if is_auth:
+                        headers["Authorization"] = f"Bearer {self._jwt_token('GET', path)}"
+                    r = self.http.get(url, headers=headers)
+                    r.raise_for_status()
+                    payload = r.json()
+                    product_payload = payload.get("product") if isinstance(payload.get("product"), dict) else payload
+                    pid = sanitize_product_id(product_payload.get("product_id") if isinstance(product_payload, dict) else candidate, default="")
+                    if pid:
+                        self.product_metadata_by_id[pid] = product_payload if isinstance(product_payload, dict) else {"product_id": pid}
+                        if pid not in candidates:
+                            candidates.insert(0, pid)
+                    break
+                except Exception as exc:
+                    msg = self._format_request_error(exc)
+                    if "INVALID_ARGUMENT" not in msg and "404" not in msg:
+                        errors.append(f"product lookup failed for {candidate}: {msg}")
+                    continue
+
+        # De-dupe after metadata additions.
+        seen: List[str] = []
+        for candidate in candidates:
+            clean = sanitize_product_id(candidate, default="")
+            if clean and clean not in seen:
+                seen.append(clean)
+        return seen, errors
+
     def public_candles(self, product_id: str, minutes: int, bars: int) -> pd.DataFrame:
         requested_minutes = max(1, int(minutes))
         if requested_minutes in RESAMPLE_TIMEFRAME_MAP:
@@ -1272,8 +1500,12 @@ class CoinbaseAdvancedClient:
         exchange_start_ts = end_ts - granularity * exchange_limit
         errors: List[str] = []
         requested_product = sanitize_product_id(product_id, default="")
-        candidates = self._candidate_product_ids(requested_product)
         is_futures = self._is_futures_product(requested_product)
+        if is_futures or requested_product.endswith("-CDE"):
+            candidates, product_lookup_errors = self._validate_or_discover_advanced_product(requested_product)
+            errors.extend(product_lookup_errors[:2])
+        else:
+            candidates = self._candidate_product_ids(requested_product)
 
         if intx_granularity and "-PERP" in requested_product:
             for candidate in self._intx_candidates(requested_product):
@@ -1318,6 +1550,14 @@ class CoinbaseAdvancedClient:
                             self.last_public_error = ""
                             return df
                         errors.append(f"advanced auth candles returned 0 rows for {candidate}")
+                        if is_futures:
+                            df = self._advanced_ticker_fallback(candidate, requested_minutes, bars, advanced_start_ts, end_ts)
+                            if not df.empty:
+                                self.last_public_error = (
+                                    f"{candidate}: candle endpoint returned 0 rows; using Advanced ticker/trades fallback. "
+                                    "Treat candle history as degraded for thin CFM futures."
+                                )
+                                return df
                     except Exception as exc:
                         msg = self._format_request_error(exc)
                         if self._looks_like_private_key_error(exc):
@@ -1325,6 +1565,14 @@ class CoinbaseAdvancedClient:
                             errors.append(f"advanced auth candles skipped: {self._auth_disabled_error}")
                         else:
                             errors.append(f"advanced auth candles failed for {candidate}: {msg}")
+                            if is_futures and ("INVALID_ARGUMENT" in msg or "product_id argument is invalid" in msg):
+                                df = self._advanced_marketdata_fallback(candidate, requested_minutes, bars, advanced_start_ts, end_ts)
+                                if not df.empty:
+                                    self.last_public_error = (
+                                        f"{candidate}: candle endpoint rejected/returned no history; using Advanced market-data fallback "
+                                        "(ticker/book/product). Treat candle history as degraded."
+                                    )
+                                    return df
                 elif self.secrets and self._auth_disabled_error:
                     errors.append(f"advanced auth candles skipped: {self._auth_disabled_error}")
                 elif self.secrets and jwt is None:
@@ -1347,8 +1595,25 @@ class CoinbaseAdvancedClient:
                         self.last_public_error = ""
                         return df
                     errors.append(f"advanced public candles returned 0 rows for {candidate}")
+                    if is_futures:
+                        df = self._advanced_ticker_fallback(candidate, requested_minutes, bars, advanced_start_ts, end_ts)
+                        if not df.empty:
+                            self.last_public_error = (
+                                f"{candidate}: candle endpoint returned 0 rows; using Advanced ticker/trades fallback. "
+                                "Treat candle history as degraded for thin CFM futures."
+                            )
+                            return df
                 except Exception as exc:
-                    errors.append(f"advanced public candles failed for {candidate}: {self._format_request_error(exc)}")
+                    msg = self._format_request_error(exc)
+                    errors.append(f"advanced public candles failed for {candidate}: {msg}")
+                    if is_futures and ("INVALID_ARGUMENT" in msg or "product_id argument is invalid" in msg):
+                        df = self._advanced_marketdata_fallback(candidate, requested_minutes, bars, advanced_start_ts, end_ts)
+                        if not df.empty:
+                            self.last_public_error = (
+                                f"{candidate}: public candle endpoint rejected/returned no history; using Advanced market-data fallback "
+                                "(ticker/book/product). Treat candle history as degraded."
+                            )
+                            return df
 
         # Coinbase Exchange API does not know Advanced Trade CFM futures symbols, so skip that noisy 404 path.
         # For USDC-quoted products, still allow the USD market-data candidate through Exchange
@@ -1388,7 +1653,10 @@ class CoinbaseAdvancedClient:
                 except Exception as exc:
                     errors.append(f"exchange latest candles failed for {candidate}: {self._format_request_error(exc)}")
         else:
-            errors.append(f"exchange candles skipped for {requested_product}: CFM/Advanced futures are not Coinbase Exchange products")
+            errors.append(
+                f"exchange candles skipped for {requested_product}: CFM futures use Coinbase Advanced Trade API, "
+                "not Coinbase Exchange. No separate CDE/FairX API key is required; use the CDP/Advanced JWT key from Coinbase API settings."
+            )
 
         # Keep the UI readable: de-duplicate, cap repeated PyJWT warnings, and avoid multi-screen exception spam.
         compact_errors: List[str] = []
@@ -1431,6 +1699,14 @@ class CoinbaseAdvancedClient:
 
     @staticmethod
     def _normalize_private_key_input(value: Any) -> str:
+        """Accept Coinbase CDP private keys pasted as JSON, PEM, or escaped one-line PEM.
+
+        Coinbase often displays the key as a JSON string like:
+        -----BEGIN EC PRIVATE KEY-----\n...==\n-----END EC PRIVATE KEY-----\n
+
+        Tk text boxes and JSON exports can preserve the two characters \ and n instead
+        of real newlines. Normalize that form into a PEM that PyJWT/cryptography can load.
+        """
         text = str(value or "").strip()
         obj = CoinbaseAdvancedClient._json_obj_from_text(text)
         if obj:
@@ -1441,18 +1717,40 @@ class CoinbaseAdvancedClient:
                     break
         if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
             text = text[1:-1].strip()
-        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+        text = (
+            text.replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\u000a", "\n")
+            .replace("\u000d", "\n")
+        )
         text = CONTROL_CHARS_RE.sub(" ", text).strip()
         for marker in ("EC PRIVATE KEY", "PRIVATE KEY"):
             begin = f"-----BEGIN {marker}-----"
             end = f"-----END {marker}-----"
             if begin in text and end in text:
                 body = text.split(begin, 1)[1].split(end, 1)[0]
-                compact_body = re.sub(r"\s+", "", body)
+                compact_body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
                 if compact_body:
                     wrapped_body = "\n".join(compact_body[i : i + 64] for i in range(0, len(compact_body), 64))
                     return f"{begin}\n{wrapped_body}\n{end}\n"
         return text
+
+    @staticmethod
+    def _validate_private_key_pem(value: str) -> Tuple[bool, str]:
+        pem = CoinbaseAdvancedClient._normalize_private_key_input(value)
+        if not pem:
+            return False, "Private key is empty."
+        if "-----BEGIN" not in pem or "-----END" not in pem:
+            return False, "Private key is not a PEM block. Paste the full BEGIN/END EC PRIVATE KEY text or the JSON privateKey field."
+        try:
+            serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+            return True, "Private key PEM loaded successfully."
+        except TypeError:
+            return False, "Private key appears encrypted with a passphrase; Coinbase CDP JWT signing needs the unencrypted privateKey export."
+        except Exception as exc:
+            return False, f"Private key PEM could not be loaded after newline repair: {exc}"
 
     @staticmethod
     def extract_coinbase_credentials(api_key_input: Any, private_key_input: Any) -> Tuple[str, str, List[str]]:
@@ -1490,8 +1788,9 @@ class CoinbaseAdvancedClient:
     @staticmethod
     def _friendly_private_key_error() -> str:
         return (
-            "Coinbase private key format is invalid. Re-save the full CDP API private key PEM, "
-            "including BEGIN/END lines, or paste the JSON key's privateKey value; do not paste an API secret/password."
+            "Coinbase private key format is invalid. Paste the full EC private key PEM exactly as exported, "
+            "including BEGIN/END lines. Escaped newline markers are OK; the app will repair them. "
+            "Do not paste a Coinbase API secret/password or public key."
         )
 
     def _jwt_token(self, method: str, path: str) -> str:
@@ -1504,18 +1803,40 @@ class CoinbaseAdvancedClient:
         algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "ES256"), max_chars=24).strip() or "ES256"
         if not api_key or not private_key:
             raise RuntimeError("Coinbase credentials are required.")
+
+        # Coinbase Advanced REST JWTs must be signed against the full v3 brokerage
+        # request URI, e.g. "GET api.coinbase.com/api/v3/brokerage/accounts".
+        # The app passes short Advanced paths such as "/products/.../candles", so
+        # normalize them here before building the token.
+        clean_path = str(path or "").strip()
+        if not clean_path.startswith("/"):
+            clean_path = f"/{clean_path}"
+        if not clean_path.startswith("/api/v3/brokerage"):
+            clean_path = f"/api/v3/brokerage{clean_path}"
+        signed_uri = f"{method.upper()} api.coinbase.com{clean_path}"
+
+        try:
+            signing_key = serialization.load_pem_private_key(private_key.encode("utf-8"), password=None)
+        except Exception as exc:
+            if self._looks_like_private_key_error(exc):
+                raise RuntimeError(self._friendly_private_key_error()) from exc
+            raise
+
         now = int(time.time())
         payload = {
-            "iss": api_key,
             "sub": api_key,
+            "iss": "cdp",
             "nbf": now,
-            "iat": now,
-            "exp": now + 60,
-            "aud": "retail_rest_api",
-            "uris": [f"{method.upper()} api.coinbase.com{path}"],
+            "exp": now + 120,
+            "uri": signed_uri,
         }
         try:
-            token = jwt.encode(payload, private_key, algorithm=algorithm, headers={"kid": api_key})
+            token = jwt.encode(
+                payload,
+                signing_key,
+                algorithm=algorithm,
+                headers={"kid": api_key, "nonce": uuid.uuid4().hex},
+            )
         except Exception as exc:
             if self._looks_like_private_key_error(exc):
                 raise RuntimeError(self._friendly_private_key_error()) from exc
@@ -2681,13 +3002,86 @@ def _tail_sentence_window(text: str, *, max_chars: int = LITERT_OVERLAP_CHARS) -
     return tail.lstrip()
 
 
+def _extract_reply_headings(text: str, *, limit: int = 10) -> List[str]:
+    clean = sanitize_structured_text(text, max_chars=120000)
+    headings: List[str] = []
+    for line in clean.splitlines():
+        stripped = line.strip().strip("#* _`:-")
+        if not stripped or len(stripped) > 90:
+            continue
+        looks_like_heading = (
+            line.lstrip().startswith("#")
+            or (line.strip().startswith("**") and line.strip().endswith("**"))
+            or bool(re.match(r"^(?:\d+\.|[-*])\s*(Thesis|Long|Short|Flat|Risk|Confidence|Invalidation|Data Quality|Regime|Income)", line.strip(), re.I))
+        )
+        if looks_like_heading and stripped not in headings:
+            headings.append(stripped)
+        if len(headings) >= limit:
+            break
+    return headings
+
+
+def _prior_chunk_digest(text: str, *, max_chars: int = 900) -> str:
+    """Small deterministic digest for continuation prompts; avoids asking the model to reread/rewrite everything."""
+    clean = sanitize_structured_text(text, max_chars=120000).strip()
+    if not clean:
+        return "No prior chunk yet."
+    headings = _extract_reply_headings(clean, limit=8)
+    tail = _tail_sentence_window(clean, max_chars=520)
+    words = re.findall(r"[A-Za-z0-9_.%-]+", clean.lower())
+    unique_ratio = (len(set(words)) / max(1, len(words))) if words else 0.0
+    digest = [f"Prior length: {len(clean)} chars; lexical entropy proxy: {unique_ratio:.2f}."]
+    if headings:
+        digest.append("Sections already started: " + "; ".join(headings))
+    digest.append("Latest completed context, do not restate: " + tail)
+    out = "\n".join(digest)
+    return out[-max_chars:]
+
+
+def _chunk_entropy_telemetry(existing: str, new_chunk: str = "", *, chunk_index: int = 0, last_elapsed: Optional[float] = None) -> str:
+    """Bounded telemetry for continuation prompts using psutil plus a deterministic pseudo-quantum phase.
+
+    This is not market evidence. It only helps the local model vary continuation chunks and avoid loops.
+    """
+    sample = sanitize_structured_text((existing[-2000:] + "\n" + new_chunk[-1000:]), max_chars=4000)
+    words = re.findall(r"[A-Za-z0-9_.%-]+", sample.lower())
+    unique_ratio = (len(set(words)) / max(1, len(words))) if words else 0.0
+    bigrams = list(zip(words, words[1:])) if len(words) > 1 else []
+    repeat_ratio = 1.0 - (len(set(bigrams)) / max(1, len(bigrams))) if bigrams else 0.0
+    try:
+        digest = hashlib.sha256(sample.encode("utf-8", "ignore")).digest()
+        phase = int.from_bytes(digest[:2], "big") % 300
+        qx = (digest[2] / 127.5) - 1.0
+        qy = (digest[3] / 127.5) - 1.0
+        qz = (digest[4] / 127.5) - 1.0
+    except Exception:
+        phase, qx, qy, qz = 0, 0.0, 0.0, 0.0
+    if psutil is not None:
+        try:
+            cpu = float(psutil.cpu_percent(interval=None))
+            mem = float(psutil.virtual_memory().percent)
+        except Exception:
+            cpu, mem = 0.0, 0.0
+    else:
+        cpu, mem = 0.0, 0.0
+    timing = "n/a" if last_elapsed is None else f"{last_elapsed:.2f}s"
+    return (
+        f"chunk={chunk_index + 1}; last_chunk_elapsed={timing}; cpu={cpu:.1f}%; mem={mem:.1f}%; "
+        f"entropy_unique={unique_ratio:.2f}; repeat_pressure={repeat_ratio:.2f}; "
+        f"phase={phase}/300; q=({qx:+.2f},{qy:+.2f},{qz:+.2f})"
+    )
+
+
 def _build_chunked_initial_prompt(prompt: str) -> str:
+    telemetry = _chunk_entropy_telemetry("", "", chunk_index=0, last_elapsed=None)
     controlled = (
         sanitize_structured_text(prompt, max_chars=22000)
         + "\n\nOUTPUT CONTROL:\n"
-        + "Write a complete memo in compact sections. Prefer concise bullets over long prose. "
+        + "Write one complete memo in compact sections. Prefer concise bullets over long prose. "
+        + "Avoid reintroducing the same evidence in later sections; each section must add new decision value. "
         + "When near the limit, stop only at a clean sentence boundary and end with exactly "
-        + f"{LITERT_CONTINUE_MARKER}. Do not use that marker if every requested section is complete."
+        + f"{LITERT_CONTINUE_MARKER}. Do not use that marker if every requested section is complete.\n"
+        + f"LOCAL GENERATION STATE (for pacing only, not evidence): {telemetry}"
     )
     return trim_for_litert_context(controlled, max_input_tokens=1350)
 
@@ -2709,38 +3103,98 @@ def _missing_reply_surface(combined_reply: str) -> str:
     return ", ".join(missing) if missing else "None obvious; continue only unfinished thought and close cleanly."
 
 
-def _build_continuation_prompt(original_prompt: str, combined_reply: str, chunk_index: int) -> str:
-    overlap = _tail_sentence_window(combined_reply, max_chars=LITERT_OVERLAP_CHARS)
-    original_tail = sanitize_structured_text(original_prompt, max_chars=2400)[-1600:]
+def _build_continuation_prompt(
+    original_prompt: str,
+    combined_reply: str,
+    chunk_index: int,
+    *,
+    last_elapsed: Optional[float] = None,
+    repeat_pressure: float = 0.0,
+) -> str:
+    overlap = _tail_sentence_window(combined_reply, max_chars=max(420, int(LITERT_OVERLAP_CHARS * 0.68)))
+    original_tail = sanitize_structured_text(original_prompt, max_chars=2400)[-1400:]
     missing = _missing_reply_surface(combined_reply)
+    digest = _prior_chunk_digest(combined_reply, max_chars=850)
+    telemetry = _chunk_entropy_telemetry(combined_reply, "", chunk_index=chunk_index, last_elapsed=last_elapsed)
+    anti_loop = (
+        "Repeat pressure is elevated. Move directly to the next missing section; do not restate evidence, thesis, or headings already listed in the digest. "
+        if repeat_pressure >= 0.34 else
+        "Continue with fresh incremental content only; avoid repeating prior wording. "
+    )
     continuation = (
-        "CONTINUATION TASK - OVERLAP CHUNKING SURFACE:\n"
-        "Continue the SAME answer. Do not restart the memo. Do not summarize the prior answer. "
-        "The OVERLAP below is already printed; use it only to resume smoothly, and do not repeat it unless a few words are needed for grammar. "
-        "Start exactly after the overlap, at the next missing sentence/section. Maintain the same formatting. "
-        "Finish any missing surfaces listed below, then close the answer cleanly. "
+        "CONTINUATION TASK - STITCHED NON-REDUNDANT MODE:\n"
+        "Continue the SAME answer. Do not restart the memo. Do not summarize the prior answer to the user. "
+        "Use the digest only as memory, not as output text. "
+        + anti_loop
+        + "The OVERLAP below is already printed; resume after it and do not repeat it verbatim. "
+        "If a section already exists, only add a genuinely new missing detail or move to the next section. "
+        "Close cleanly once all missing surfaces are complete. "
         f"If more space is still needed, stop at a sentence boundary and end with exactly {LITERT_CONTINUE_MARKER}.\n\n"
+        f"LOCAL GENERATION STATE (pacing only, not market evidence):\n{telemetry}\n\n"
+        f"PRIOR CHUNK DIGEST - DO NOT OUTPUT THIS DIGEST:\n{digest}\n\n"
         f"MISSING / UNFINISHED SURFACES:\n{missing}\n\n"
         f"REQUEST / PACKET TAIL FOR CONTEXT:\n{original_tail}\n\n"
         f"OVERLAP - DO NOT REPEAT VERBATIM:\n{overlap}\n\n"
-        f"CONTINUATION PART {chunk_index + 1}:"
+        f"CONTINUATION PART {chunk_index + 1} - START WITH THE NEXT NEW SENTENCE:"
     )
-    return trim_for_litert_context(continuation, max_input_tokens=1050)
+    return trim_for_litert_context(continuation, max_input_tokens=1120)
 
 
 def _normalize_for_overlap(value: str) -> str:
     return re.sub(r"\s+", " ", sanitize_structured_text(value, max_chars=80000)).strip().lower()
 
 
+def _sentence_fingerprint(sentence: str) -> str:
+    normalized = _normalize_for_overlap(sentence)
+    normalized = re.sub(r"[^a-z0-9.%$ -]", "", normalized)
+    return normalized[:240]
+
+
+def _dedupe_repeated_lines_and_sentences(existing: str, incoming: str) -> str:
+    """Remove lines/sentences from a new chunk that already appeared recently in the combined answer."""
+    left_norm = _normalize_for_overlap(existing[-6000:])
+    kept_blocks: List[str] = []
+    for block in re.split(r"(\n\s*\n)", incoming):
+        if not block.strip() or re.match(r"\n\s*\n", block):
+            kept_blocks.append(block)
+            continue
+        # Exact/near-exact paragraph duplicate.
+        if len(block.strip()) > 80 and _normalize_for_overlap(block) in left_norm:
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", block)
+        kept_sentences: List[str] = []
+        for sent in sentences:
+            fp = _sentence_fingerprint(sent)
+            if len(fp) > 60 and fp in left_norm:
+                continue
+            kept_sentences.append(sent)
+        rebuilt = " ".join(s.strip() for s in kept_sentences if s.strip()).strip()
+        if rebuilt:
+            kept_blocks.append(rebuilt)
+    return "".join(kept_blocks).strip()
+
+
+def _new_chunk_repeat_pressure(existing: str, new_chunk: str) -> float:
+    left = _normalize_for_overlap(existing[-7000:])
+    words = re.findall(r"[a-z0-9_.%-]+", _normalize_for_overlap(new_chunk))
+    if len(words) < 12 or not left:
+        return 0.0
+    ngrams = [" ".join(words[i:i + 8]) for i in range(0, max(0, len(words) - 7), 4)]
+    if not ngrams:
+        return 0.0
+    hits = sum(1 for gram in ngrams if gram and gram in left)
+    return hits / max(1, len(ngrams))
+
+
 def _merge_continuation_chunk(existing: str, new_chunk: str) -> str:
-    """Merge continuation chunks while trimming repeated overlap at the seam."""
+    """Merge continuation chunks while trimming repeated overlap and redundant restarts."""
     left = sanitize_structured_text(existing, max_chars=120000).rstrip()
     right = sanitize_structured_text(new_chunk, max_chars=80000).lstrip()
     if not left:
         return right.strip()
     if not right:
         return left.strip()
-    max_check = min(1200, len(left), len(right))
+    max_check = min(1600, len(left), len(right))
     best = 0
     for size in range(max_check, 40, -1):
         if _normalize_for_overlap(left[-size:]) == _normalize_for_overlap(right[:size]):
@@ -2748,12 +3202,13 @@ def _merge_continuation_chunk(existing: str, new_chunk: str) -> str:
             break
     if best:
         right = right[best:].lstrip()
-    left_tail_norm = _normalize_for_overlap(left[-1800:])
-    paragraphs = re.split(r"(\n\s*\n)", right, maxsplit=2)
-    first_para = paragraphs[0].strip() if paragraphs else ""
-    if first_para and _normalize_for_overlap(first_para) in left_tail_norm:
-        right = "".join(paragraphs[1:]).lstrip() if len(paragraphs) > 1 else ""
+    # Remove common model restart preambles in continuation chunks.
+    right = re.sub(r"^(?:Here(?:'s| is) (?:the )?(?:continued|continuation).*?:\s*)", "", right, flags=re.I | re.S)
+    right = _dedupe_repeated_lines_and_sentences(left, right)
+    if not right:
+        return left.strip()
     return (left + "\n\n" + right).strip()
+
 
 def generate_text_litert_chunked(
     *,
@@ -2765,19 +3220,23 @@ def generate_text_litert_chunked(
     max_chunks: int = LITERT_MAX_REPLY_CHUNKS,
     status_callback: Optional[Any] = None,
 ) -> str:
-    """Generate long LiteRT answers as overlapping continuation chunks."""
+    """Generate long LiteRT answers as stitched continuation chunks with anti-repetition pacing."""
     output_tokens = max(320, min(clamp_litert_output_tokens(max_tokens), LITERT_REPLY_CHUNK_TOKENS))
     original_prompt = trim_for_litert_context(prompt, max_input_tokens=1350)
     current_prompt = _build_chunked_initial_prompt(original_prompt)
     total = max(1, int(max_chunks))
     combined = ""
     stopped_at_limit = False
+    last_elapsed: Optional[float] = None
+    repeat_pressure = 0.0
+    empty_or_redundant_chunks = 0
     for chunk_index in range(total):
         if status_callback:
             try:
                 status_callback(chunk_index + 1, total, "generating")
             except Exception:
                 pass
+        t0 = time.perf_counter()
         raw = generate_text_litert_subprocess(
             model_path=model_path,
             prompt=current_prompt,
@@ -2785,15 +3244,28 @@ def generate_text_litert_chunked(
             top_p=top_p,
             max_tokens=output_tokens,
         )
+        last_elapsed = time.perf_counter() - t0
         cleaned, requested_continue = _strip_continue_marker(raw)
+        repeat_pressure = _new_chunk_repeat_pressure(combined, cleaned)
+        before_len = len(combined)
         if cleaned:
             combined = _merge_continuation_chunk(combined, cleaned)
+        added_chars = len(combined) - before_len
+        if added_chars < 90 and chunk_index > 0:
+            empty_or_redundant_chunks += 1
+        else:
+            empty_or_redundant_chunks = 0
         needs_more = requested_continue or _looks_cut_off(cleaned or raw, output_tokens=output_tokens)
         if _reply_completion_score(combined) < 0.74 and chunk_index == 0:
             needs_more = True
+        # If the model is looping, stop rather than printing another redundant chunk.
+        if repeat_pressure >= 0.55 and added_chars < 220:
+            needs_more = False
+        if empty_or_redundant_chunks >= 2:
+            needs_more = False
         if status_callback:
             try:
-                status_callback(chunk_index + 1, total, "merged")
+                status_callback(chunk_index + 1, total, f"merged · +{added_chars} chars · repeat {repeat_pressure:.2f}")
             except Exception:
                 pass
         if not needs_more:
@@ -2801,7 +3273,13 @@ def generate_text_litert_chunked(
         if chunk_index >= total - 1:
             stopped_at_limit = True
             break
-        current_prompt = _build_continuation_prompt(original_prompt, combined, chunk_index + 1)
+        current_prompt = _build_continuation_prompt(
+            original_prompt,
+            combined,
+            chunk_index + 1,
+            last_elapsed=last_elapsed,
+            repeat_pressure=repeat_pressure,
+        )
     final = combined.strip()
     if stopped_at_limit and _looks_cut_off(final, output_tokens=output_tokens):
         final += "\n\n[Stopped after the configured continuation limit. Increase LITERT_MAX_REPLY_CHUNKS for longer answers.]"
@@ -4480,17 +4958,17 @@ class App(ctk.CTk):
         self.setup_passphrase_entry.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=(8, 6))
 
         ctk.CTkLabel(tab, text="Coinbase API Key", text_color=THEME["muted"]).grid(row=4, column=0, sticky="w", padx=12, pady=6)
-        self.setup_coinbase_api_key_entry = ctk.CTkEntry(tab, placeholder_text="Paste Coinbase API key")
+        self.setup_coinbase_api_key_entry = ctk.CTkEntry(tab, placeholder_text="Paste Coinbase CDP API key name: organizations/{org}/apiKeys/{key}")
         self.setup_coinbase_api_key_entry.grid(row=4, column=1, sticky="ew", padx=(6, 12), pady=6)
 
-        ctk.CTkLabel(tab, text="Coinbase Private Key", text_color=THEME["muted"]).grid(row=5, column=0, sticky="nw", padx=12, pady=6)
+        ctk.CTkLabel(tab, text="Coinbase Private Key / JSON", text_color=THEME["muted"]).grid(row=5, column=0, sticky="nw", padx=12, pady=6)
         self.setup_coinbase_private_key_box = ctk.CTkTextbox(tab, height=120, fg_color=THEME["card"], text_color=THEME["text"], border_color=THEME["line"], border_width=1, corner_radius=14)
         self.setup_coinbase_private_key_box.grid(row=5, column=1, sticky="ew", padx=(6, 12), pady=6)
         self.setup_coinbase_private_key_box.insert("1.0", "")
         self.setup_coinbase_private_key_box.configure(state="disabled")
         setup_key_actions = ctk.CTkFrame(tab, fg_color="transparent")
         setup_key_actions.grid(row=6, column=1, sticky="w", padx=(6, 12), pady=(0, 8))
-        ctk.CTkButton(setup_key_actions, text="Paste Key", command=self._paste_private_key_from_clipboard, width=108, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(setup_key_actions, text="Paste PEM/JSON", command=self._paste_private_key_from_clipboard, width=128, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
         ctk.CTkButton(setup_key_actions, text="Load Key File", command=self._load_private_key_file, width=118, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=6)
         ctk.CTkButton(setup_key_actions, text="Clear", command=self._clear_private_key_value, width=86, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(6, 0))
 
@@ -4775,7 +5253,7 @@ class App(ctk.CTk):
         self.coinbase_api_key_entry.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
         row += 1
 
-        ctk.CTkLabel(tab, text="Coinbase Private Key", text_color=THEME["muted"]).grid(row=row, column=0, sticky="nw", padx=12, pady=6)
+        ctk.CTkLabel(tab, text="Coinbase Private Key / JSON", text_color=THEME["muted"]).grid(row=row, column=0, sticky="nw", padx=12, pady=6)
         self.coinbase_private_key_box = ctk.CTkTextbox(tab, height=84)
         self.coinbase_private_key_box.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
         self.coinbase_private_key_box.insert("1.0", "")
@@ -4784,7 +5262,7 @@ class App(ctk.CTk):
 
         key_actions = ctk.CTkFrame(tab, fg_color="transparent")
         key_actions.grid(row=row, column=1, sticky="w", padx=(6, 12), pady=(0, 8))
-        ctk.CTkButton(key_actions, text="Paste Key", command=self._paste_private_key_from_clipboard, width=108, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(key_actions, text="Paste PEM/JSON", command=self._paste_private_key_from_clipboard, width=128, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
         ctk.CTkButton(key_actions, text="Load Key File", command=self._load_private_key_file, width=118, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=6)
         ctk.CTkButton(key_actions, text="Clear", command=self._clear_private_key_value, width=86, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(6, 0))
         row += 1
@@ -5077,7 +5555,8 @@ class App(ctk.CTk):
             widget.configure(state="disabled")
 
     def _set_private_key_value(self, value: str) -> None:
-        self._coinbase_private_key_plain = sanitize_structured_text(value or "", max_chars=50000)
+        normalized = CoinbaseAdvancedClient._normalize_private_key_input(value or "")
+        self._coinbase_private_key_plain = sanitize_structured_text(normalized, max_chars=50000)
         self._render_private_key_preview()
 
     def _get_private_key_value(self) -> str:
@@ -5093,8 +5572,11 @@ class App(ctk.CTk):
         if not clean:
             messagebox.showwarning("Clipboard empty", "Copy the Coinbase private key first, then try Paste Key again.")
             return
-        self._set_private_key_value(clean)
-        self._append_settings_status("Coinbase private key loaded from clipboard and masked in the UI.")
+        normalized = CoinbaseAdvancedClient._normalize_private_key_input(clean)
+        ok, detail = CoinbaseAdvancedClient._validate_private_key_pem(normalized)
+        self._set_private_key_value(normalized)
+        self._append_settings_status("Coinbase private key loaded from clipboard, newline-repaired, and masked in the UI.")
+        self._append_settings_status(detail if ok else f"Key warning: {detail}")
 
     def _load_private_key_file(self) -> None:
         chosen = filedialog.askopenfilename(
@@ -5111,8 +5593,11 @@ class App(ctk.CTk):
         if not clean:
             messagebox.showwarning("Empty file", "That private-key file was empty.")
             return
-        self._set_private_key_value(clean)
-        self._append_settings_status(f"Coinbase private key loaded from file and masked in the UI: {chosen}")
+        normalized = CoinbaseAdvancedClient._normalize_private_key_input(clean)
+        ok, detail = CoinbaseAdvancedClient._validate_private_key_pem(normalized)
+        self._set_private_key_value(normalized)
+        self._append_settings_status(f"Coinbase private key loaded from file, newline-repaired, and masked in the UI: {chosen}")
+        self._append_settings_status(detail if ok else f"Key warning: {detail}")
 
     def _clear_private_key_value(self) -> None:
         self._coinbase_private_key_plain = ""
@@ -5704,6 +6189,9 @@ class App(ctk.CTk):
         api_key, private_key, credential_notes = CoinbaseAdvancedClient.extract_coinbase_credentials(raw_api_key, raw_private_key)
         for note in credential_notes:
             self._append_settings_status(note)
+        if private_key:
+            key_ok, key_detail = CoinbaseAdvancedClient._validate_private_key_pem(private_key)
+            self._append_settings_status(key_detail if key_ok else f"Key warning: {key_detail}")
         existing_vault = bool(self.settings.data.get("secrets"))
         has_secret_input = bool(api_key or private_key)
         if has_secret_input:
