@@ -9,6 +9,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -80,8 +82,16 @@ DEFAULT_MODEL_PATH = str(MODELS_DIR / MODEL_FILE)
 # Keep input safely below that boundary so market packets do not crash generation.
 LITERT_CONTEXT_TOKENS = 4096
 LITERT_SAFE_INPUT_TOKENS = 3000
-LITERT_SAFE_OUTPUT_TOKENS = 768
+LITERT_SAFE_OUTPUT_TOKENS = 1024
+LITERT_REPLY_CHUNK_TOKENS = 896
+LITERT_MAX_REPLY_CHUNKS = 4
+LITERT_CONTINUE_MARKER = "[[CONTINUE]]"
 LITERT_CHAR_BUDGET = 9000
+# Keep heavy LiteRT inference outside Tkinter's process. Some LiteRT wheels
+# hold the GIL during generation, which makes Tkinter look frozen even when
+# called from a Python thread.
+LITERT_SUBPROCESS_TIMEOUT_SECONDS = 240
+LITERT_WORKER_FLAG = "--litert-text-worker"
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 COINBASE_PUBLIC_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 COINBASE_AUTH_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}/candles"
@@ -535,7 +545,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "model_path": DEFAULT_MODEL_PATH,
     "model_temperature": 0.20,
     "model_top_p": 0.90,
-    "model_max_tokens": 768,
+    "model_max_tokens": 1024,
     "use_visual_llm": True,
     "paper_trading_enabled": True,
     "live_trading_enabled": False,
@@ -2467,6 +2477,244 @@ def clamp_litert_output_tokens(max_tokens: Any) -> int:
     return max(64, min(requested, LITERT_SAFE_OUTPUT_TOKENS))
 
 
+def _short_runtime_detail(text: Any, *, max_chars: int = 1400) -> str:
+    clean = sanitize_structured_text(text, max_chars=max_chars * 2)
+    return clean if len(clean) <= max_chars else clean[: max_chars - 24].rstrip() + " ... [truncated]"
+
+
+def generate_text_litert_subprocess(
+    *,
+    model_path: str,
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_seconds: int = LITERT_SUBPROCESS_TIMEOUT_SECONDS,
+) -> str:
+    """Run LiteRT text generation in a child Python process.
+
+    Tkinter is single-threaded, and some LiteRT Python bindings keep the GIL
+    while decoding. A normal threading.Thread can therefore still starve the
+    Tk event loop. This subprocess boundary keeps the GUI responsive and lets
+    us kill a stuck generation cleanly.
+    """
+    clean_prompt = trim_for_litert_context(prompt)
+    output_tokens = clamp_litert_output_tokens(max_tokens)
+    script_path = Path(__file__).resolve()
+    if not script_path.is_file():
+        runtime = Gemma4Runtime(model_path)
+        return runtime.generate_text(
+            clean_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=output_tokens,
+        )
+
+    payload = {
+        "model_path": str(model_path),
+        "prompt": clean_prompt,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_tokens": int(output_tokens),
+    }
+    with tempfile.TemporaryDirectory(prefix="litert_prompt_") as tmp:
+        tmp_path = Path(tmp)
+        input_path = tmp_path / "request.json"
+        output_path = tmp_path / "response.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        env = os.environ.copy()
+        env["LITERT_CHILD_PROCESS"] = "1"
+        # Cap native worker threads so LiteRT generation does not starve Tkinter.
+        env.setdefault("OMP_NUM_THREADS", "2")
+        env.setdefault("OPENBLAS_NUM_THREADS", "2")
+        env.setdefault("MKL_NUM_THREADS", "2")
+        env.setdefault("VECLIB_MAXIMUM_THREADS", "2")
+        env.setdefault("NUMEXPR_NUM_THREADS", "2")
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path), LITERT_WORKER_FLAG, str(input_path), str(output_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=creationflags,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=max(30, int(timeout_seconds)))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise TimeoutError(
+                f"LiteRT generation exceeded {timeout_seconds}s and was stopped so the GUI stays usable. "
+                "Try a shorter prompt, lower Max Tokens, or use the local fallback."
+            )
+
+        result: Dict[str, Any] = {}
+        if output_path.exists():
+            try:
+                loaded = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    result = loaded
+            except Exception as exc:
+                result = {"ok": False, "error": f"Could not read worker response: {exc}"}
+
+        if proc.returncode == 0 and result.get("ok"):
+            text = sanitize_structured_text(result.get("text", ""), max_chars=50000)
+            if text:
+                return text
+            raise RuntimeError("LiteRT worker returned an empty response.")
+
+        detail_parts = []
+        if result.get("error"):
+            detail_parts.append(str(result.get("error")))
+        if stderr:
+            detail_parts.append("stderr: " + _short_runtime_detail(stderr))
+        if stdout:
+            detail_parts.append("stdout: " + _short_runtime_detail(stdout))
+        detail = "; ".join(part for part in detail_parts if part) or f"worker exited with code {proc.returncode}"
+        raise RuntimeError("LiteRT worker failed: " + detail)
+
+
+def _run_litert_text_worker_cli(input_path: str, output_path: str) -> int:
+    try:
+        # Lower priority inside the child worker. This preserves UI responsiveness
+        # on machines where local inference saturates CPU.
+        try:
+            if os.name == "nt" and psutil is not None:
+                psutil.Process(os.getpid()).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            elif hasattr(os, "nice"):
+                os.nice(5)
+        except Exception:
+            pass
+        payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+        runtime = Gemma4Runtime(str(payload.get("model_path") or DEFAULT_MODEL_PATH))
+        text = runtime.generate_text(
+            str(payload.get("prompt") or ""),
+            temperature=float(payload.get("temperature", 0.20)),
+            top_p=float(payload.get("top_p", 0.90)),
+            max_tokens=clamp_litert_output_tokens(payload.get("max_tokens", LITERT_SAFE_OUTPUT_TOKENS)),
+        )
+        Path(output_path).write_text(json.dumps({"ok": True, "text": text}), encoding="utf-8")
+        return 0
+    except Exception as exc:
+        try:
+            Path(output_path).write_text(json.dumps({"ok": False, "error": str(exc)}), encoding="utf-8")
+        except Exception:
+            pass
+        return 1
+
+
+def _strip_continue_marker(text: str) -> Tuple[str, bool]:
+    clean = sanitize_structured_text(text, max_chars=80000)
+    upper = clean.upper()
+    markers = (LITERT_CONTINUE_MARKER, "[CONTINUE]", "CONTINUE")
+    requested = False
+    for marker in markers:
+        idx = upper.rfind(marker.upper())
+        if idx >= 0 and len(clean) - idx <= 80:
+            clean = clean[:idx].rstrip()
+            requested = True
+            break
+    return clean.strip(), requested
+
+
+def _looks_cut_off(text: str, *, output_tokens: int) -> bool:
+    clean = sanitize_structured_text(text, max_chars=80000).rstrip()
+    if not clean:
+        return False
+    if approximate_litert_tokens(clean) >= int(output_tokens) * 0.86:
+        return True
+    tail = clean[-160:].strip()
+    if not tail:
+        return False
+    # Common hard cut symptom: ends mid-word or mid-heading instead of with a closing mark.
+    if tail[-1] not in ".!?)]}\"'`":
+        return True
+    if clean.count("```") % 2 == 1:
+        return True
+    return False
+
+
+def _build_chunked_initial_prompt(prompt: str) -> str:
+    return trim_for_litert_context(
+        sanitize_structured_text(prompt, max_chars=50000)
+        + "\n\nOUTPUT CONTROL:\n"
+        + "Write a complete, useful answer. If the answer cannot fit in this reply, "
+        + f"end the reply with exactly {LITERT_CONTINUE_MARKER}. Do not use that marker if the answer is complete."
+    )
+
+
+def _build_continuation_prompt(original_prompt: str, combined_reply: str, chunk_index: int) -> str:
+    previous_tail = sanitize_structured_text(combined_reply, max_chars=7000)[-5200:]
+    continuation = (
+        "\n\nCONTINUATION TASK:\n"
+        "You are continuing the same market memo. Do not restart and do not repeat completed sections. "
+        "Continue exactly from where the previous answer stopped. Finish any missing headings, invalidations, risk box, confidence, and change-of-mind section. "
+        f"If more space is still needed, end with exactly {LITERT_CONTINUE_MARKER}.\n\n"
+        f"PREVIOUS ANSWER TAIL:\n{previous_tail}\n\n"
+        f"CONTINUE AS PART {chunk_index + 1}:"
+    )
+    return trim_for_litert_context(sanitize_structured_text(original_prompt, max_chars=50000) + continuation)
+
+
+def generate_text_litert_chunked(
+    *,
+    model_path: str,
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_chunks: int = LITERT_MAX_REPLY_CHUNKS,
+    status_callback: Optional[Any] = None,
+) -> str:
+    """Generate long LiteRT answers as bounded continuation chunks."""
+    output_tokens = max(256, min(clamp_litert_output_tokens(max_tokens), LITERT_REPLY_CHUNK_TOKENS))
+    chunks: List[str] = []
+    original_prompt = trim_for_litert_context(prompt)
+    current_prompt = _build_chunked_initial_prompt(original_prompt)
+    total = max(1, int(max_chunks))
+    for chunk_index in range(total):
+        if status_callback:
+            try:
+                status_callback(chunk_index + 1, total, "generating")
+            except Exception:
+                pass
+        raw = generate_text_litert_subprocess(
+            model_path=model_path,
+            prompt=current_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=output_tokens,
+        )
+        cleaned, requested_continue = _strip_continue_marker(raw)
+        if cleaned:
+            chunks.append(cleaned)
+        combined = "\n\n".join(chunks).strip()
+        needs_more = requested_continue or _looks_cut_off(cleaned or raw, output_tokens=output_tokens)
+        if status_callback:
+            try:
+                status_callback(chunk_index + 1, total, "received")
+            except Exception:
+                pass
+        if not needs_more or chunk_index >= total - 1:
+            break
+        current_prompt = _build_continuation_prompt(original_prompt, combined, chunk_index + 1)
+    final = ""
+    for idx, part in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            final += f"Part {idx}/{len(chunks)}\n{part.strip()}\n\n"
+        else:
+            final += part.strip()
+    if len(chunks) >= total and _looks_cut_off(chunks[-1], output_tokens=output_tokens):
+        final = final.rstrip() + "\n\n[Stopped after the configured chunk limit. Increase LITERT_MAX_REPLY_CHUNKS if you want even longer replies.]"
+    return final.strip() or "LiteRT returned an empty chunked response."
+
+
 class Gemma4Runtime:
     def __init__(self, model_path: str):
         self.model_path = model_path
@@ -3904,6 +4152,12 @@ class App(ctk.CTk):
         self._coinbase_private_key_plain = ""
         self.chart_fullscreen_active = False
         self.side_tray_hidden = bool(self.settings.data.get("side_tray_hidden", False))
+        self._llm_running_jobs = 0
+        self._llm_spinner_index = 0
+        self._llm_started_at = 0.0
+        self._llm_status_context = "LLM"
+        self._llm_active_chunk = ""
+        self._llm_spinner_after_id: Optional[str] = None
 
         self._build()
         self._load_settings_into_widgets()
@@ -4243,6 +4497,21 @@ class App(ctk.CTk):
         ctk.CTkButton(side, text="Execution Map", command=lambda: self._seed_and_send(self.prompt_pack.data["execution_request"]), fg_color=THEME["accent_3"], text_color="#0c1720", corner_radius=14, width=136).grid(row=2, column=0, sticky="ew", pady=6)
         ctk.CTkButton(side, text="Risk Officer", command=lambda: self._seed_and_send(self.prompt_pack.data["risk_officer_request"]), fg_color=THEME["card_soft"], text_color=THEME["text"], corner_radius=14, width=136).grid(row=3, column=0, sticky="ew", pady=6)
 
+        status_row = ctk.CTkFrame(tab, fg_color="transparent")
+        status_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        status_row.grid_columnconfigure(0, weight=1)
+        self.llm_status_label = ctk.CTkLabel(
+            status_row,
+            text="LLM idle",
+            text_color=THEME["muted"],
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+        )
+        self.llm_status_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.llm_progress = ctk.CTkProgressBar(status_row, mode="indeterminate", height=8)
+        self.llm_progress.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.llm_progress.set(0)
+
     def _build_vision_tab(self) -> None:
         tab = self.vision_tab
         tab.grid_columnconfigure(0, weight=1)
@@ -4319,6 +4588,8 @@ class App(ctk.CTk):
         ctk.CTkButton(ai_card, text="AI Market Read", command=lambda: self.ask_trade_ai("market_read"), fg_color=THEME["accent"], text_color="#121212").grid(row=1, column=0, sticky="ew", padx=(12, 4), pady=(2, 12))
         ctk.CTkButton(ai_card, text="AI Risk Audit", command=lambda: self.ask_trade_ai("risk_audit"), fg_color=THEME["card_soft"]).grid(row=1, column=1, sticky="ew", padx=4, pady=(2, 12))
         ctk.CTkButton(ai_card, text="AI Execution Plan", command=lambda: self.ask_trade_ai("execution_plan"), fg_color=THEME["accent_2"], text_color="#08131f").grid(row=1, column=2, sticky="ew", padx=(4, 12), pady=(2, 12))
+        self.trade_ai_status_label = ctk.CTkLabel(ai_card, text="AI idle", text_color=THEME["muted"], anchor="w")
+        self.trade_ai_status_label.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 10))
 
         self.trade_log = ctk.CTkTextbox(tab, fg_color=THEME["card"], text_color=THEME["text"], border_color=THEME["line"], border_width=1, corner_radius=14)
         self.trade_log.grid(row=10, column=0, columnspan=2, sticky="nsew", padx=12, pady=(6, 12))
@@ -4494,6 +4765,61 @@ class App(ctk.CTk):
             "- Entropic RAG memory only uses in-session derived states.\n"
             "- Use the Hide Tray button beside chart zoom for a large chart without fullscreen.\n",
         )
+
+    def _set_llm_chunk_status(self, chunk: str) -> None:
+        self._llm_active_chunk = sanitize_ui_text(chunk, max_chars=80)
+
+    def _start_llm_indicator(self, context: str = "LLM") -> None:
+        self._llm_running_jobs += 1
+        self._llm_status_context = sanitize_ui_text(context, max_chars=48) or "LLM"
+        if self._llm_running_jobs == 1:
+            self._llm_started_at = time.time()
+            self._llm_spinner_index = 0
+            self._llm_active_chunk = ""
+            try:
+                if hasattr(self, "llm_progress"):
+                    self.llm_progress.start()
+            except Exception:
+                pass
+            self._animate_llm_indicator()
+
+    def _finish_llm_indicator(self, final_text: str = "LLM idle") -> None:
+        self._llm_running_jobs = max(0, self._llm_running_jobs - 1)
+        if self._llm_running_jobs > 0:
+            return
+        self._llm_active_chunk = ""
+        try:
+            if hasattr(self, "llm_progress"):
+                self.llm_progress.stop()
+                self.llm_progress.set(0)
+        except Exception:
+            pass
+        clean = sanitize_ui_text(final_text, max_chars=96) or "LLM idle"
+        for attr in ("llm_status_label", "trade_ai_status_label"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.configure(text=clean, text_color=THEME["muted"])
+                except Exception:
+                    pass
+
+    def _animate_llm_indicator(self) -> None:
+        if self._llm_running_jobs <= 0:
+            return
+        frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+        frame = frames[self._llm_spinner_index % len(frames)]
+        self._llm_spinner_index += 1
+        elapsed = int(max(0, time.time() - self._llm_started_at))
+        chunk = f" · {self._llm_active_chunk}" if self._llm_active_chunk else ""
+        text = f"{frame} {self._llm_status_context} running · {elapsed}s{chunk}"
+        for attr in ("llm_status_label", "trade_ai_status_label"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.configure(text=text, text_color=THEME["accent"])
+                except Exception:
+                    pass
+        self._llm_spinner_after_id = self.after(160, self._animate_llm_indicator)
 
     def _seed_chat_prompt(self, prompt: str) -> None:
         self.chat_input.delete("1.0", "end")
@@ -5572,7 +5898,9 @@ class App(ctk.CTk):
         product_id = sanitize_product_id(self.settings.data.get("product_id"), default="ETH-PERP")
         if hasattr(self, "trade_log"):
             self.trade_log.insert("end", f"\n[AI REQUEST] {product_id} · {mode.replace('_', ' ').title()}\n")
+            self.trade_log.insert("end", "[AI STATUS] LiteRT generation started. The spinner below will move while chunks are being generated.\n")
             self.trade_log.see("end")
+        self._start_llm_indicator(f"Trade AI · {mode.replace('_', ' ').title()}")
         threading.Thread(target=self._trade_ai_worker, args=(user_text,), daemon=True).start()
 
     def _trade_ai_worker(self, user_text: str) -> None:
@@ -5581,11 +5909,13 @@ class App(ctk.CTk):
                 reply = "Market packet unavailable. Refresh market data first."
             elif self.gemma.available:
                 prompt = self.prompt_architect.build_gemma4_prompt(self.surface, self.frames, self.reference_frames, user_text)
-                reply = self.gemma.generate_text(
-                    prompt,
+                reply = generate_text_litert_chunked(
+                    model_path=self.gemma.model_path,
+                    prompt=prompt,
                     temperature=float(self.settings.data.get("model_temperature", 0.20)),
                     top_p=float(self.settings.data.get("model_top_p", 0.90)),
-                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 768)),
+                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 1024)),
+                    status_callback=lambda idx, total, phase: self.after(0, lambda i=idx, t=total, p=phase: self._set_llm_chunk_status(f"chunk {i}/{t} {p}")),
                 )
             else:
                 reply = (
@@ -5599,6 +5929,7 @@ class App(ctk.CTk):
             if hasattr(self, "trade_log"):
                 self.trade_log.insert("end", f"[AI REPLY]\n{reply}\n")
                 self.trade_log.see("end")
+            self._finish_llm_indicator("Trade AI complete")
         self.after(0, append)
 
     def ask_model(self) -> None:
@@ -5607,6 +5938,8 @@ class App(ctk.CTk):
             return
         self.chat_input.delete("1.0", "end")
         self._append_chat("User", user_text)
+        self._append_chat("System", "LiteRT generation started. Watch the animated status bar below; long replies are extended with continuation chunks.")
+        self._start_llm_indicator("Oracle")
         threading.Thread(target=self._ask_model_worker, args=(user_text,), daemon=True).start()
 
     def _ask_model_worker(self, user_text: str) -> None:
@@ -5615,11 +5948,13 @@ class App(ctk.CTk):
                 reply = "Market packet unavailable. Refresh market data first."
             elif self.gemma.available:
                 prompt = self.prompt_architect.build_gemma4_prompt(self.surface, self.frames, self.reference_frames, user_text)
-                reply = self.gemma.generate_text(
-                    prompt,
+                reply = generate_text_litert_chunked(
+                    model_path=self.gemma.model_path,
+                    prompt=prompt,
                     temperature=float(self.settings.data.get("model_temperature", 0.20)),
                     top_p=float(self.settings.data.get("model_top_p", 0.90)),
-                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 768)),
+                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 1024)),
+                    status_callback=lambda idx, total, phase: self.after(0, lambda i=idx, t=total, p=phase: self._set_llm_chunk_status(f"chunk {i}/{t} {p}")),
                 )
             else:
                 reply = (
@@ -5629,7 +5964,7 @@ class App(ctk.CTk):
                 )
         except Exception as exc:
             reply = f"Gemma runtime unavailable; using local signal lab.\n\n{self._fallback_commentary(user_text)}\n\nRuntime detail: {exc}"
-        self.after(0, lambda: self._append_chat("Oracle", reply))
+        self.after(0, lambda: (self._append_chat("Oracle", reply), self._finish_llm_indicator("Oracle complete")))
 
     def _fallback_commentary(self, user_text: str) -> str:
         if self.surface is None:
@@ -5657,6 +5992,7 @@ class App(ctk.CTk):
             return
         prompt = self.vision_prompt.get("1.0", "end").strip() or "Analyze the chart image."
         snapshot = self.chart.export_snapshot()
+        self._start_llm_indicator("Vision LLM")
         threading.Thread(target=self._vision_worker, args=(snapshot, prompt), daemon=True).start()
 
     def run_selected_vision_analysis(self) -> None:
@@ -5664,11 +6000,12 @@ class App(ctk.CTk):
             messagebox.showwarning("No image", "Choose an image first.")
             return
         prompt = self.vision_prompt.get("1.0", "end").strip() or "Analyze the chart image."
+        self._start_llm_indicator("Vision LLM")
         threading.Thread(target=self._vision_worker, args=(self.vision_image_path, prompt), daemon=True).start()
 
     def _vision_worker(self, image_path: str, prompt: str) -> None:
         if self.surface is None:
-            self.after(0, lambda: self.vision_output.insert("end", "\nNo market packet available.\n"))
+            self.after(0, lambda: (self.vision_output.insert("end", "\nNo market packet available.\n"), self._finish_llm_indicator("Vision stopped")))
             return
         try:
             if self.gemma.available and self.settings.data.get("use_visual_llm", True):
@@ -5689,7 +6026,7 @@ class App(ctk.CTk):
                 )
         except Exception as exc:
             reply = f"Visual LLM path failed.\nImage: {image_path}\nDetail: {exc}\n\nFallback packet analysis:\n{self._fallback_commentary(prompt)}"
-        self.after(0, lambda: self.vision_output.insert("end", f"\n{reply}\n"))
+        self.after(0, lambda: (self.vision_output.insert("end", f"\n{reply}\n"), self._finish_llm_indicator("Vision complete")))
 
     def seed_trade_from_surface(self) -> None:
         if self.surface is None:
