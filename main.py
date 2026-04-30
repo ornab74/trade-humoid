@@ -60,15 +60,14 @@ except Exception:
     litert_lm = None
 
 try:
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 except Exception as exc:
     raise RuntimeError("cryptography is required.") from exc
 
 
-APP_NAME = "Gemma4 ETH-PERP Entropic Quantum Intelligence"
+APP_NAME = "Entropic Coinbase Quantum Intelligence"
 SETTINGS_PATH = Path("main_eth_perp_quantum_settings.json")
 PRODUCT_CACHE_DB_PATH = Path("coinbase_product_cache.sqlite3")
 MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
@@ -77,13 +76,18 @@ EXPECTED_MODEL_SHA256 = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27
 MODELS_DIR = Path("models")
 LITERT_CACHE_DIR = Path(".litert_lm_cache")
 DEFAULT_MODEL_PATH = str(MODELS_DIR / MODEL_FILE)
+# Gemma 4 LiteRT community builds commonly expose a 4096-token text context.
+# Keep input safely below that boundary so market packets do not crash generation.
+LITERT_CONTEXT_TOKENS = 4096
+LITERT_SAFE_INPUT_TOKENS = 3000
+LITERT_SAFE_OUTPUT_TOKENS = 768
+LITERT_CHAR_BUDGET = 9000
 COINBASE_EXCHANGE_CANDLES = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 COINBASE_PUBLIC_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 COINBASE_AUTH_ADVANCED_CANDLES = "https://api.coinbase.com/api/v3/brokerage/products/{product_id}/candles"
 COINBASE_PUBLIC_PRODUCTS = "https://api.coinbase.com/api/v3/brokerage/market/products"
 COINBASE_AUTH_PRODUCTS_PATH = "/products"
 COINBASE_ADVANCED_BASE = "https://api.coinbase.com/api/v3/brokerage"
-COINBASE_AUTH_URI_PREFIX = "/api/v3/brokerage"
 COINBASE_INTX_CANDLES = "https://api.international.coinbase.com/api/v1/instruments/{instrument}/candles"
 NETWORK_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0)
 EASTERN_TZ = "US/Eastern"
@@ -157,6 +161,9 @@ THEME = {
     "accent": "#ffd60a",
     "accent_2": "#9ad7ff",
     "accent_3": "#89f0d2",
+    # Dark gold keeps the selected tab readable with white text.
+    "tab_selected": "#5a4700",
+    "tab_selected_hover": "#735b00",
     "warning": "#ffcf66",
     "danger": "#ff657d",
     "success": "#8dffc7",
@@ -528,7 +535,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "model_path": DEFAULT_MODEL_PATH,
     "model_temperature": 0.20,
     "model_top_p": 0.90,
-    "model_max_tokens": 1400,
+    "model_max_tokens": 768,
     "use_visual_llm": True,
     "paper_trading_enabled": True,
     "live_trading_enabled": False,
@@ -538,7 +545,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_order_quote_size": 25.0,
     "default_order_leverage": 3.0,
     "margin_type": "CROSS",
-    "jwt_algorithm": "AUTO",
+    "jwt_algorithm": "ES256",
     "chart_show_ribbon_cloud": True,
     "chart_show_quantum_panel": True,
     "chart_show_ema233": True,
@@ -652,19 +659,40 @@ def sanitize_product_id(value: Any, *, default: str = "ETH-USD") -> str:
 
 def safe_product_label(product: Dict[str, Any]) -> str:
     pid = sanitize_product_id(product.get("product_id"), default="ETH-USD")
+    future_details = product.get("future_product_details") if isinstance(product.get("future_product_details"), dict) else {}
+    perpetual_details = future_details.get("perpetual_details") if isinstance(future_details.get("perpetual_details"), dict) else {}
+
     display = sanitize_ui_text(
         product.get("display_name_overwrite")
         or product.get("display_name")
-        or product.get("future_product_details", {}).get("display_name")
+        or future_details.get("display_name")
         or product.get("alias")
         or pid,
         max_chars=96,
     )
-    ptype = sanitize_ui_text(product.get("product_type") or "", max_chars=24)
-    venue = sanitize_ui_text(product.get("product_venue") or product.get("future_product_details", {}).get("venue") or "", max_chars=32)
-    suffix = " · ".join(part for part in (ptype, venue) if part)
-    return f"{pid} — {display}" + (f" ({suffix})" if suffix else "")
 
+    def compact_market_tag(value: Any) -> str:
+        tag = sanitize_ui_text(value or "", max_chars=64).upper()
+        for prefix in (
+            "FUTURES_UNDERLYING_TYPE_",
+            "FUTURES_ASSET_TYPE_",
+            "UNKNOWN_",
+        ):
+            if tag.startswith(prefix):
+                tag = tag[len(prefix):]
+        tag = tag.replace("_", " ").strip()
+        return tag.title() if tag else ""
+
+    ptype = sanitize_ui_text(product.get("product_type") or "", max_chars=24)
+    venue = sanitize_ui_text(product.get("product_venue") or future_details.get("venue") or "", max_chars=32)
+    underlying = compact_market_tag(
+        future_details.get("futures_asset_type")
+        or perpetual_details.get("underlying_type")
+        or future_details.get("underlying_type")
+        or ""
+    )
+    suffix = " · ".join(part for part in (ptype, venue, underlying) if part)
+    return f"{pid} — {display}" + (f" ({suffix})" if suffix else "")
 
 def resolve_native_image_path(image_path: Optional[str | Path]) -> Optional[Path]:
     if not image_path:
@@ -1374,17 +1402,18 @@ class CoinbaseAdvancedClient:
 
     @staticmethod
     def _extract_api_key_name(value: Any) -> str:
-        """Return the Coinbase CDP API key identifier used in JWT iss/sub/kid."""
+        """Return the exact CDP API key name expected in JWT iss/sub/kid."""
         text = sanitize_structured_text(value or "", max_chars=20000).strip()
         obj = CoinbaseAdvancedClient._json_obj_from_text(text)
         if obj:
-            for key in (
-                "name", "apiKey", "api_key", "apiKeyId", "api_key_id",
-                "apiKeyName", "api_key_name", "keyName", "key_name", "keyId", "key_id", "id",
-            ):
+            for key in ("name", "apiKeyName", "api_key_name", "keyName", "key_name"):
                 candidate = sanitize_structured_text(obj.get(key) or "", max_chars=5000).strip()
                 if candidate:
                     return candidate
+            # Last resort only: older exports/tools may call it id. Coinbase usually wants full 'name'.
+            candidate = sanitize_structured_text(obj.get("id") or obj.get("keyId") or obj.get("key_id") or "", max_chars=5000).strip()
+            if candidate:
+                return candidate
         if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
             text = text[1:-1].strip()
         return text
@@ -1394,10 +1423,7 @@ class CoinbaseAdvancedClient:
         text = str(value or "").strip()
         obj = CoinbaseAdvancedClient._json_obj_from_text(text)
         if obj:
-            for key in (
-                "privateKey", "private_key", "apiKeySecret", "api_key_secret",
-                "keySecret", "key_secret", "secret", "pem",
-            ):
+            for key in ("privateKey", "private_key", "pem", "secret"):
                 candidate = obj.get(key)
                 if candidate:
                     text = str(candidate).strip()
@@ -1419,7 +1445,7 @@ class CoinbaseAdvancedClient:
 
     @staticmethod
     def extract_coinbase_credentials(api_key_input: Any, private_key_input: Any) -> Tuple[str, str, List[str]]:
-        """Accept separate fields or pasted CDP JSON and return (api_key_id/name, secret/private_key, notes)."""
+        """Accept separate fields or a pasted CDP JSON key and return (api_key_name, private_key_pem, notes)."""
         notes: List[str] = []
         api_text = str(api_key_input or "").strip()
         key_text = str(private_key_input or "").strip()
@@ -1435,48 +1461,10 @@ class CoinbaseAdvancedClient:
                 api_key = from_json_api
             if from_json_key and (not private_key or key_obj):
                 private_key = from_json_key
-            notes.append("Detected Coinbase key JSON and extracted the API key identifier plus privateKey/secret.")
-        if api_key and not (api_key.startswith("organizations/") or re.fullmatch(r"[0-9a-fA-F-]{32,80}", api_key)):
-            notes.append("API key identifier does not look like a full CDP name or UUID; Coinbase may return 401 key unrecognized.")
+            notes.append("Detected Coinbase CDP JSON key export and extracted name/privateKey fields.")
+        if api_key and not api_key.startswith("organizations/"):
+            notes.append("API key does not look like the full CDP name organizations/{org}/apiKeys/{key}; Coinbase may return 401 key unrecognized.")
         return api_key.strip(), private_key.strip(), notes
-
-    @staticmethod
-    def _auth_request_path(path: str) -> str:
-        """Coinbase JWT uris must sign the full REST path, including /api/v3/brokerage."""
-        clean = sanitize_structured_text(path or "", max_chars=1000).strip()
-        if not clean.startswith("/"):
-            clean = "/" + clean
-        if clean.startswith(COINBASE_AUTH_URI_PREFIX + "/") or clean == COINBASE_AUTH_URI_PREFIX:
-            return clean
-        return COINBASE_AUTH_URI_PREFIX + clean
-
-    @staticmethod
-    def _private_key_signing_material(secret: str, algorithm: str) -> Tuple[str, str]:
-        """Normalize Coinbase ECDSA PEM or Ed25519 secret for PyJWT."""
-        alg = (algorithm or "AUTO").strip()
-        text = CoinbaseAdvancedClient._normalize_private_key_input(secret)
-        if alg.upper() == "AUTO":
-            if "BEGIN EC PRIVATE KEY" in text:
-                alg = "ES256"
-            elif "BEGIN PRIVATE KEY" in text:
-                alg = "EdDSA"
-            else:
-                alg = "EdDSA"
-        if alg == "EdDSA" and "BEGIN" not in text:
-            compact = re.sub(r"\s+", "", text)
-            try:
-                raw = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=False)
-                if len(raw) >= 32:
-                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
-                    pem = key.private_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PrivateFormat.PKCS8,
-                        encryption_algorithm=serialization.NoEncryption(),
-                    ).decode("utf-8")
-                    return alg, pem
-            except Exception:
-                pass
-        return alg, text
 
     @staticmethod
     def _looks_like_private_key_error(exc: Exception) -> bool:
@@ -1502,23 +1490,21 @@ class CoinbaseAdvancedClient:
             self.secrets.get("coinbase_api_key") or "",
             self.secrets.get("coinbase_private_key") or "",
         )
-        configured_algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "AUTO"), max_chars=24).strip() or "AUTO"
+        algorithm = sanitize_structured_text(self.settings.data.get("jwt_algorithm", "ES256"), max_chars=24).strip() or "ES256"
         if not api_key or not private_key:
             raise RuntimeError("Coinbase credentials are required.")
-        algorithm, signing_key = self._private_key_signing_material(private_key, configured_algorithm)
-        request_path = self._auth_request_path(path)
         now = int(time.time())
         payload = {
             "iss": api_key,
             "sub": api_key,
             "nbf": now,
             "iat": now,
-            "exp": now + 120,
+            "exp": now + 60,
             "aud": "retail_rest_api",
-            "uris": [f"{method.upper()} api.coinbase.com{request_path}"],
+            "uris": [f"{method.upper()} api.coinbase.com{path}"],
         }
         try:
-            token = jwt.encode(payload, signing_key, algorithm=algorithm, headers={"kid": api_key, "nonce": uuid.uuid4().hex})
+            token = jwt.encode(payload, private_key, algorithm=algorithm, headers={"kid": api_key})
         except Exception as exc:
             if self._looks_like_private_key_error(exc):
                 raise RuntimeError(self._friendly_private_key_error()) from exc
@@ -1536,19 +1522,25 @@ class CoinbaseAdvancedClient:
         r.raise_for_status()
         return r.json()
 
-    def test_authentication(self) -> Tuple[bool, str]:
-        """Make a small authenticated request and return a readable result."""
-        try:
-            payload = self._private_request("GET", "/accounts", None)
-            count = len(payload.get("accounts", [])) if isinstance(payload, dict) else 0
-            return True, f"Coinbase auth OK. Accounts endpoint returned {count} account(s)."
-        except Exception as exc:
-            return False, self._format_request_error(exc)
-
     def list_products(self, *, master_key: Optional[bytes] = None, cache: Optional[EncryptedProductStore] = None) -> List[Dict[str, Any]]:
-        """Load Coinbase products, including expiring CFM futures such as NOL-18MAY26-CDE."""
+        """Load Coinbase products, including CFM futures across commodity, stock, ETF, and index underlyings."""
         products_by_id: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
+
+        futures_underlying_types = (
+            "FUTURES_UNDERLYING_TYPE_SPOT",
+            "FUTURES_UNDERLYING_TYPE_INDEX",
+            "FUTURES_UNDERLYING_TYPE_EQUITY",
+            "FUTURES_UNDERLYING_TYPE_EQUITY_INDEX",
+            "FUTURES_UNDERLYING_TYPE_EQUITY_ETF",
+            "FUTURES_UNDERLYING_TYPE_PREIPO",
+            "FUTURES_UNDERLYING_TYPE_COMMOD",
+            "FUTURES_UNDERLYING_TYPE_COMMOD_ETF",
+            "FUTURES_UNDERLYING_TYPE_COMMOD_INDEX",
+            "FUTURES_UNDERLYING_TYPE_ADR",
+            "FUTURES_UNDERLYING_TYPE_FOREIGN_EQUITY",
+            "FUTURES_UNDERLYING_TYPE_OTC",
+        )
 
         def add_many(items: Any) -> None:
             if not isinstance(items, list):
@@ -1561,44 +1553,65 @@ class CoinbaseAdvancedClient:
                     item["product_id"] = pid
                     products_by_id[pid] = item
 
-        if self.secrets:
-            auth_queries = [
-                {"limit": 250, "get_all_products": "true"},
-                {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "EXPIRING", "expiring_contract_status": "STATUS_UNEXPIRED"},
-                {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"},
-                {"limit": 250, "product_type": "FUTURE", "futures_underlying_type": "FUTURES_UNDERLYING_TYPE_COMMOD"},
-            ]
-            for params in auth_queries:
-                cursor = None
-                while True:
-                    request_params = dict(params)
-                    if cursor:
-                        request_params["cursor"] = cursor
-                    try:
+        def fetch_paginated_products(*, url: str, base_params: Dict[str, Any], auth: bool, label: str) -> None:
+            cursor = None
+            while True:
+                request_params = dict(base_params)
+                if cursor:
+                    request_params["cursor"] = cursor
+                try:
+                    headers = {"Cache-Control": "no-cache"}
+                    if auth:
                         token = self._jwt_token("GET", COINBASE_AUTH_PRODUCTS_PATH)
-                        r = self.http.get(
-                            f"{COINBASE_ADVANCED_BASE}{COINBASE_AUTH_PRODUCTS_PATH}",
-                            params=request_params,
-                            headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-cache"},
-                        )
-                        r.raise_for_status()
-                        payload = r.json()
-                        add_many(payload.get("products", []))
-                        pagination = payload.get("pagination") or {}
-                        cursor = pagination.get("next_cursor") if pagination.get("has_next") else None
-                        if not cursor:
-                            break
-                    except Exception as exc:
-                        errors.append(f"auth products failed for {request_params}: {self._format_request_error(exc)}")
+                        headers["Authorization"] = f"Bearer {token}"
+                    r = self.http.get(url, params=request_params, headers=headers)
+                    r.raise_for_status()
+                    payload = r.json()
+                    add_many(payload.get("products", []))
+                    pagination = payload.get("pagination") or {}
+                    cursor = pagination.get("next_cursor") if pagination.get("has_next") else None
+                    if not cursor:
                         break
+                except Exception as exc:
+                    errors.append(f"{label} products failed for {request_params}: {self._format_request_error(exc)}")
+                    break
 
-        try:
-            r = self.http.get(COINBASE_PUBLIC_PRODUCTS, params={"limit": 250}, headers={"Cache-Control": "no-cache"})
-            r.raise_for_status()
-            add_many(r.json().get("products", []))
-        except Exception as exc:
-            errors.append(f"public products failed: {self._format_request_error(exc)}")
+        core_queries: List[Dict[str, Any]] = [
+            {"limit": 250},
+            {"limit": 250, "product_type": "SPOT"},
+            {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "EXPIRING", "expiring_contract_status": "STATUS_UNEXPIRED"},
+            {"limit": 250, "product_type": "FUTURE", "contract_expiry_type": "PERPETUAL"},
+        ]
+        futures_underlying_queries: List[Dict[str, Any]] = [
+            {
+                "limit": 250,
+                "product_type": "FUTURE",
+                "futures_underlying_type": underlying,
+                "expiring_contract_status": "STATUS_UNEXPIRED",
+            }
+            for underlying in futures_underlying_types
+        ]
 
+        if self.secrets:
+            auth_queries = [{"limit": 250, "get_all_products": "true"}] + core_queries + futures_underlying_queries
+            for params in auth_queries:
+                fetch_paginated_products(
+                    url=f"{COINBASE_ADVANCED_BASE}{COINBASE_AUTH_PRODUCTS_PATH}",
+                    base_params=params,
+                    auth=True,
+                    label="auth",
+                )
+
+        public_queries = core_queries + futures_underlying_queries
+        for params in public_queries:
+            fetch_paginated_products(
+                url=COINBASE_PUBLIC_PRODUCTS,
+                base_params=params,
+                auth=False,
+                label="public",
+            )
+
+        # Keep a known oil futures symbol visible even before a successful authenticated refresh.
         if "NOL-18MAY26-CDE" not in products_by_id:
             products_by_id["NOL-18MAY26-CDE"] = {
                 "product_id": "NOL-18MAY26-CDE",
@@ -1613,13 +1626,27 @@ class CoinbaseAdvancedClient:
                 },
             }
 
-        products = sorted(products_by_id.values(), key=lambda p: (str(p.get("product_type") or ""), str(p.get("product_id") or "")))
+        def sort_key(product: Dict[str, Any]) -> Tuple[int, str, str]:
+            ptype = str(product.get("product_type") or "").upper()
+            details = product.get("future_product_details") if isinstance(product.get("future_product_details"), dict) else {}
+            futures_tag = str(
+                details.get("futures_asset_type")
+                or (details.get("perpetual_details") or {}).get("underlying_type")
+                or ""
+            ).upper()
+            is_non_crypto_future = ptype == "FUTURE" and (
+                bool(details.get("non_crypto"))
+                or any(tag in futures_tag for tag in ("COMMOD", "EQUITY", "INDEX", "ETF", "ADR", "PREIPO", "OTC"))
+            )
+            priority = 0 if is_non_crypto_future else 1 if ptype == "FUTURE" else 2
+            return (priority, str(product.get("display_name") or product.get("product_id") or ""), str(product.get("product_id") or ""))
+
+        products = sorted(products_by_id.values(), key=sort_key)
         self.product_metadata_by_id = {sanitize_product_id(p.get("product_id"), default=""): p for p in products if sanitize_product_id(p.get("product_id"), default="")}
         if products and cache is not None and master_key:
             cache.save_products(products, master_key)
         self.last_public_error = "; ".join(errors[:4]) if errors and not products else ""
         return products
-
     def preview_market_order(self, side: str, quote_size: str, product_id: str, leverage: Optional[str], margin_type: Optional[str]) -> dict:
         payload = {
             "product_id": product_id,
@@ -2343,13 +2370,55 @@ def create_default_messages(system_text: Optional[str] = None) -> List[dict]:
 
 
 def response_to_text(response: Any) -> str:
-    if not isinstance(response, dict):
-        return str(response).strip()
-    texts: List[str] = []
-    for item in response.get("content", []):
-        if isinstance(item, dict) and item.get("type") == "text":
-            texts.append(str(item.get("text", "")))
-    return "".join(texts).strip()
+    if response is None:
+        return ""
+    if isinstance(response, bytes):
+        try:
+            return response.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+    if isinstance(response, str):
+        return response.strip()
+    if isinstance(response, list):
+        return "".join(response_to_text(item) for item in response).strip()
+    if isinstance(response, dict):
+        for key in ("text", "output_text", "message", "response", "generated_text"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        texts: List[str] = []
+        content = response.get("content", [])
+        if isinstance(content, str):
+            return content.strip()
+        for item in content if isinstance(content, list) else []:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    texts.append(str(item.get("text", "")))
+                elif isinstance(item.get("text"), str):
+                    texts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                texts.append(item)
+        if texts:
+            return "".join(texts).strip()
+        # Some bindings return nested candidates/output structures.
+        for key in ("candidates", "outputs", "choices"):
+            nested = response.get(key)
+            text = response_to_text(nested)
+            if text:
+                return text
+        return ""
+    for attr in ("text", "output_text", "content", "message", "response"):
+        try:
+            value = getattr(response, attr)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        text = response_to_text(value)
+        if text:
+            return text
+    rendered = str(response).strip()
+    return "" if rendered in {"None", "{}", "[]"} else rendered
 
 
 def create_user_message(user_text: str, image_path: Optional[Path] = None) -> Any:
@@ -2363,6 +2432,39 @@ def create_user_message(user_text: str, image_path: Optional[Path] = None) -> An
             {"type": "image", "path": str(image_path)},
         ],
     }
+
+
+def approximate_litert_tokens(text: str) -> int:
+    # Conservative approximation for English + JSON-style market packets.
+    # It intentionally overestimates so we stay under LiteRT's hard context limit.
+    clean = str(text or "")
+    return max(1, int(math.ceil(len(clean) / 3.0)))
+
+
+def trim_for_litert_context(text: Any, *, max_input_tokens: int = LITERT_SAFE_INPUT_TOKENS) -> str:
+    clean = sanitize_structured_text(text, max_chars=50000)
+    safe_tokens = max(512, min(int(max_input_tokens), LITERT_CONTEXT_TOKENS - 512))
+    char_budget = min(LITERT_CHAR_BUDGET, max(1600, safe_tokens * 3))
+    if len(clean) <= char_budget:
+        return clean
+
+    marker = (
+        "\n\n[... compressed for LiteRT 4096-token context; "
+        "older candles / verbose packet fields removed ...]\n\n"
+    )
+    # Preserve the system framing at the front and the actual request / output
+    # instructions at the end. The bulky MARKET_PACKET lives in the middle.
+    head_chars = min(2600, max(900, char_budget // 3))
+    tail_chars = max(900, char_budget - head_chars - len(marker))
+    return (clean[:head_chars].rstrip() + marker + clean[-tail_chars:].lstrip()).strip()
+
+
+def clamp_litert_output_tokens(max_tokens: Any) -> int:
+    try:
+        requested = int(max_tokens)
+    except Exception:
+        requested = LITERT_SAFE_OUTPUT_TOKENS
+    return max(64, min(requested, LITERT_SAFE_OUTPUT_TOKENS))
 
 
 class Gemma4Runtime:
@@ -2386,71 +2488,135 @@ class Gemma4Runtime:
 
     def generate_text(self, prompt: str, *, temperature: float, top_p: float, max_tokens: int) -> str:
         self._ensure_engine()
-        session = self._engine.create_session()
-        for name in ("prompt", "generate", "run"):
-            method = getattr(session, name, None)
-            if method is None:
-                continue
-            try:
-                response = method(
-                    sanitize_structured_text(prompt),
-                    temperature=float(temperature),
-                    top_p=float(top_p),
-                    max_tokens=int(max_tokens),
-                )
-                return response_to_text(response) or str(response).strip()
-            except TypeError:
-                try:
-                    response = method(sanitize_structured_text(prompt))
-                    return response_to_text(response) or str(response).strip()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        clean_prompt = trim_for_litert_context(prompt)
+        output_tokens = clamp_litert_output_tokens(max_tokens)
+        errors: List[str] = []
 
+        # Prefer the conversation API when present; several LiteRT Python builds
+        # expose create_session() but do not actually return text from raw session
+        # prompt/generate/run calls.
         conversation_factory = getattr(self._engine, "create_conversation", None)
         if conversation_factory is not None:
-            with conversation_factory(messages=[]) as conversation:
-                response = conversation.send_message(sanitize_structured_text(prompt))
-                return response_to_text(response) or str(response).strip()
-        raise RuntimeError("Text prompting unavailable in current LiteRT binding.")
+            try:
+                with conversation_factory(messages=[]) as conversation:
+                    response = conversation.send_message(clean_prompt)
+                    text = response_to_text(response)
+                    if text:
+                        return text
+                    errors.append("conversation returned no text")
+            except Exception as exc:
+                errors.append(f"conversation error: {exc}")
+
+        try:
+            session = self._engine.create_session()
+        except Exception as exc:
+            session = None
+            errors.append(f"create_session error: {exc}")
+
+        if session is not None:
+            for name in ("prompt", "generate", "run"):
+                method = getattr(session, name, None)
+                if method is None:
+                    continue
+                try:
+                    response = method(
+                        clean_prompt,
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        max_tokens=output_tokens,
+                    )
+                    text = response_to_text(response)
+                    if text:
+                        return text
+                    errors.append(f"session.{name} returned no text")
+                except TypeError as exc:
+                    try:
+                        response = method(clean_prompt)
+                        text = response_to_text(response)
+                        if text:
+                            return text
+                        errors.append(f"session.{name} returned no text without kwargs")
+                    except Exception as inner_exc:
+                        errors.append(f"session.{name} TypeError path failed: {inner_exc}")
+                except Exception as exc:
+                    errors.append(f"session.{name} error: {exc}")
+
+        detail = "; ".join(errors[-4:]) or "no compatible text method was available"
+        raise RuntimeError(
+            "LiteRT text generation failed after compressing the prompt to "
+            f"{len(clean_prompt):,} chars / ~{approximate_litert_tokens(clean_prompt):,} tokens. "
+            f"Detail: {detail}"
+        )
 
     def generate_multimodal(self, *, system_text: str, user_text: str, image_path: Optional[str], temperature: float, top_p: float, max_tokens: int) -> str:
         native_image_path = resolve_native_image_path(image_path)
         self._ensure_engine(needs_vision=bool(native_image_path))
+        clean_system = trim_for_litert_context(system_text, max_input_tokens=700)
+        clean_user = trim_for_litert_context(user_text, max_input_tokens=2200)
+        output_tokens = clamp_litert_output_tokens(max_tokens)
+        errors: List[str] = []
 
         conversation_factory = getattr(self._engine, "create_conversation", None)
         if conversation_factory is not None:
-            with conversation_factory(messages=create_default_messages(system_text)) as conversation:
-                response = conversation.send_message(create_user_message(user_text, native_image_path))
-                text = response_to_text(response)
-                if text:
-                    return text
-
-        session = self._engine.create_session()
-        messages: List[Any] = create_default_messages(system_text)
-        if native_image_path is None:
-            messages.append({"role": "user", "content": sanitize_structured_text(user_text)})
-        else:
-            messages.append(create_user_message(user_text, native_image_path))
-        for name in ("prompt", "generate", "run"):
-            method = getattr(session, name, None)
-            if method is None:
-                continue
             try:
-                response = method(messages, temperature=float(temperature), top_p=float(top_p), max_tokens=int(max_tokens))
-                text = response_to_text(response)
-                return text or str(response).strip()
-            except TypeError:
-                try:
-                    response = method(messages)
+                with conversation_factory(messages=create_default_messages(clean_system)) as conversation:
+                    response = conversation.send_message(create_user_message(clean_user, native_image_path))
                     text = response_to_text(response)
-                    return text or str(response).strip()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        raise RuntimeError("Multimodal prompting unavailable in current LiteRT binding.")
+                    if text:
+                        return text
+                    errors.append("multimodal conversation returned no text")
+            except Exception as exc:
+                errors.append(f"multimodal conversation error: {exc}")
+
+            # If this LiteRT wheel lacks true image support, still return a useful
+            # packet-only read instead of failing the whole UI action.
+            if native_image_path is not None:
+                try:
+                    with conversation_factory(messages=create_default_messages(clean_system)) as conversation:
+                        response = conversation.send_message(clean_user)
+                        text = response_to_text(response)
+                        if text:
+                            return text
+                        errors.append("text-only vision fallback returned no text")
+                except Exception as exc:
+                    errors.append(f"text-only vision fallback error: {exc}")
+
+        try:
+            session = self._engine.create_session()
+        except Exception as exc:
+            session = None
+            errors.append(f"create_session error: {exc}")
+
+        if session is not None:
+            messages: List[Any] = create_default_messages(clean_system)
+            if native_image_path is None:
+                messages.append({"role": "user", "content": clean_user})
+            else:
+                messages.append(create_user_message(clean_user, native_image_path))
+            for name in ("prompt", "generate", "run"):
+                method = getattr(session, name, None)
+                if method is None:
+                    continue
+                try:
+                    response = method(messages, temperature=float(temperature), top_p=float(top_p), max_tokens=output_tokens)
+                    text = response_to_text(response)
+                    if text:
+                        return text
+                    errors.append(f"session.{name} returned no multimodal text")
+                except TypeError:
+                    try:
+                        response = method(messages)
+                        text = response_to_text(response)
+                        if text:
+                            return text
+                        errors.append(f"session.{name} returned no multimodal text without kwargs")
+                    except Exception as inner_exc:
+                        errors.append(f"session.{name} TypeError path failed: {inner_exc}")
+                except Exception as exc:
+                    errors.append(f"session.{name} multimodal error: {exc}")
+
+        detail = "; ".join(errors[-5:]) or "no compatible multimodal method was available"
+        raise RuntimeError(f"LiteRT multimodal prompting failed. Detail: {detail}")
 
 
 class PromptArchitect:
@@ -2483,31 +2649,35 @@ class PromptArchitect:
         for minutes, df in sorted(frames.items()):
             if not df.empty:
                 packet["last_candles"][str(minutes)] = (
-                    df.tail(6)[["Open", "High", "Low", "Close", "Volume"]].reset_index().to_dict(orient="records")
+                    df.tail(3)[["Open", "High", "Low", "Close", "Volume"]].reset_index().to_dict(orient="records")
                 )
-        return compact_json(packet, 12000)
+        return compact_json(packet, 6400)
 
     def build_gemma4_prompt(self, surface: SurfaceState, frames: Dict[int, pd.DataFrame], reference_frames: Dict[int, pd.DataFrame], user_request: str) -> str:
         packet = self.market_packet_text(surface, frames, reference_frames)
-        return (
+        compact_directive = (
+            "Return a compact derivatives memo with: thesis, long case, short case, "
+            "flat/wait case, income research rail, invalidations, risk box, confidence, "
+            "and what would change the view. Separate evidence from inference. "
+            "Use analog memory only as analogy. Never promise profit."
+        )
+        prompt = (
             f"<|turn|>system\n{self.prompt_pack.data['system']}\n<|endturn|>\n"
-            f"<|turn|>user\nMARKET_PACKET:\n{packet}\n\nREQUEST:\n{user_request}\n\n"
-            f"INTERNAL_LENSES:\n{self.prompt_pack.data['debate_request']}\n\n"
-            f"EXECUTION_DIRECTIVE:\n{self.prompt_pack.data['execution_request']}\n\n"
-            f"RISK_AUDIT_DIRECTIVE:\n{self.prompt_pack.data['risk_officer_request']}\n\n"
-            f"Compare long, short, and flat. Use analog memory only as analogy, not proof. Do not promise profit.\n"
+            f"<|turn|>user\nMARKET_PACKET:\n{packet}\n\nREQUEST:\n{sanitize_structured_text(user_request, max_chars=1800)}\n\n"
+            f"DIRECTIVE:\n{compact_directive}\n"
             f"<|endturn|>\n<|turn|>model\n"
         )
+        return trim_for_litert_context(prompt)
 
     def build_vision_request(self, surface: SurfaceState, frames: Dict[int, pd.DataFrame], reference_frames: Dict[int, pd.DataFrame], user_request: str) -> Tuple[str, str]:
         packet = self.market_packet_text(surface, frames, reference_frames)
         user_text = (
             f"MARKET_PACKET:\n{packet}\n\n"
-            f"TASK:\n{user_request}\n\n"
+            f"TASK:\n{sanitize_structured_text(user_request, max_chars=1200)}\n\n"
             "Compare the chart image against the text packet. "
             "Call out confirmations, contradictions, sweeps, traps, ribbon shifts, and ladder magnets."
         )
-        return self.prompt_pack.data["vision_system"], user_text
+        return trim_for_litert_context(self.prompt_pack.data["vision_system"], max_input_tokens=700), trim_for_litert_context(user_text, max_input_tokens=2200)
 
 
 class DerivativesChartPanel(ctk.CTkFrame):
@@ -3530,7 +3700,7 @@ class ProductPickerDialog(ctk.CTkToplevel):
         search_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 8))
         search_row.grid_columnconfigure(0, weight=1)
         self.search_var = tk.StringVar(value="")
-        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, placeholder_text="Search markets, e.g. BTC, ARB, ETH-USD, NOL, 18MAY26, USDC")
+        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, placeholder_text="Search markets, e.g. BTC, ETH-USD, NOL oil, equity, stock, index, ETF, 18MAY26, USDC")
         self.search_entry.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(search_row, text="Clear", width=72, command=self._clear_search, fg_color=THEME["card_soft"]).grid(row=0, column=1, padx=(8, 0))
         if self.current:
@@ -3784,7 +3954,8 @@ class App(ctk.CTk):
             right,
             fg_color=THEME["panel"],
             segmented_button_fg_color=THEME["card"],
-            segmented_button_selected_color=THEME["accent"],
+            segmented_button_selected_color=THEME["tab_selected"],
+            segmented_button_selected_hover_color=THEME["tab_selected_hover"],
             segmented_button_unselected_color=THEME["card_soft"],
             text_color=THEME["text"],
             corner_radius=18,
@@ -3838,7 +4009,8 @@ class App(ctk.CTk):
             self.surface_panel,
             fg_color=THEME["card"],
             segmented_button_fg_color=THEME["card_soft"],
-            segmented_button_selected_color=THEME["accent"],
+            segmented_button_selected_color=THEME["tab_selected"],
+            segmented_button_selected_hover_color=THEME["tab_selected_hover"],
             segmented_button_unselected_color=THEME["card_soft"],
             text_color=THEME["text"],
             corner_radius=14,
@@ -4121,27 +4293,18 @@ class App(ctk.CTk):
         self.trade_reference_combo = ctk.CTkComboBox(tab, values=[str(self.settings.data.get("reference_product_id", "ETH-USD"))], state="normal")
         self.trade_reference_combo.set(str(self.settings.data.get("reference_product_id", "ETH-USD")))
 
-        order_card = ctk.CTkFrame(tab, fg_color=THEME["card"], corner_radius=16)
-        order_card.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
-        order_card.grid_columnconfigure((0, 1), weight=1)
-        ctk.CTkLabel(order_card, text="Order Ticket", text_color=THEME["text"], font=ctk.CTkFont(size=15, weight="bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 2))
-        ctk.CTkLabel(order_card, text="Side", text_color=THEME["muted"]).grid(row=1, column=0, sticky="w", padx=12, pady=(6, 0))
-        ctk.CTkLabel(order_card, text="Quote Size (USD)", text_color=THEME["muted"]).grid(row=1, column=1, sticky="w", padx=12, pady=(6, 0))
-        self.order_side = ctk.CTkComboBox(order_card, values=["BUY", "SELL"])
+        self.order_side = ctk.CTkComboBox(tab, values=["BUY", "SELL"])
         self.order_side.set("BUY")
-        self.order_side.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=(2, 8))
-        self.order_quote_size = ctk.CTkEntry(order_card, placeholder_text="Example: 25")
+        self.order_side.grid(row=2, column=0, sticky="ew", padx=(12, 6), pady=6)
+        self.order_quote_size = ctk.CTkEntry(tab, placeholder_text="Quote size in USD")
         self.order_quote_size.insert(0, str(self.settings.data.get("default_order_quote_size", 25.0)))
-        self.order_quote_size.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=(2, 8))
-        ctk.CTkLabel(order_card, text="Leverage", text_color=THEME["muted"]).grid(row=3, column=0, sticky="w", padx=12, pady=(2, 0))
-        ctk.CTkLabel(order_card, text="Margin Type", text_color=THEME["muted"]).grid(row=3, column=1, sticky="w", padx=12, pady=(2, 0))
-        self.order_leverage = ctk.CTkEntry(order_card, placeholder_text="Example: 3")
+        self.order_quote_size.grid(row=2, column=1, sticky="ew", padx=(6, 12), pady=6)
+        self.order_leverage = ctk.CTkEntry(tab, placeholder_text="Leverage")
         self.order_leverage.insert(0, str(self.settings.data.get("default_order_leverage", 3.0)))
-        self.order_leverage.grid(row=4, column=0, sticky="ew", padx=(12, 6), pady=(2, 10))
-        self.margin_type_combo = ctk.CTkComboBox(order_card, values=["CROSS", "ISOLATED", ""])
+        self.order_leverage.grid(row=3, column=0, sticky="ew", padx=(12, 6), pady=6)
+        self.margin_type_combo = ctk.CTkComboBox(tab, values=["CROSS", "ISOLATED", ""])
         self.margin_type_combo.set(str(self.settings.data.get("margin_type", "CROSS")))
-        self.margin_type_combo.grid(row=4, column=1, sticky="ew", padx=(6, 12), pady=(2, 10))
-
+        self.margin_type_combo.grid(row=3, column=1, sticky="ew", padx=(6, 12), pady=6)
         self.autonomy_size_label = ctk.CTkLabel(tab, text="—", text_color=THEME["text"])
         ctk.CTkLabel(tab, text="Autonomy Proposed Size", text_color=THEME["muted"]).grid(row=4, column=0, sticky="w", padx=12, pady=(2, 0))
         self.autonomy_size_label.grid(row=4, column=1, sticky="w", padx=12, pady=(2, 0))
@@ -4260,11 +4423,10 @@ class App(ctk.CTk):
         ctk.CTkButton(key_actions, text="Paste Key", command=self._paste_private_key_from_clipboard, width=108, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(0, 6))
         ctk.CTkButton(key_actions, text="Load Key File", command=self._load_private_key_file, width=118, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=6)
         ctk.CTkButton(key_actions, text="Clear", command=self._clear_private_key_value, width=86, height=30, fg_color=THEME["card_soft"]).pack(side="left", padx=(6, 0))
-        ctk.CTkButton(key_actions, text="Test Auth", command=self.test_coinbase_auth_action, width=98, height=30, fg_color=THEME["accent_2"], text_color="#08131f").pack(side="left", padx=(6, 0))
         row += 1
 
         ctk.CTkLabel(tab, text="JWT Algorithm", text_color=THEME["muted"]).grid(row=row, column=0, sticky="w", padx=12, pady=6)
-        self.jwt_algo_combo = ctk.CTkComboBox(tab, values=["AUTO", "ES256", "EdDSA"])
+        self.jwt_algo_combo = ctk.CTkComboBox(tab, values=["ES256", "EdDSA"])
         self.jwt_algo_combo.grid(row=row, column=1, sticky="ew", padx=(6, 12), pady=6)
         row += 1
 
@@ -4823,7 +4985,7 @@ class App(ctk.CTk):
         self._apply_global_market(product_id, reference_id, refresh=True)
 
     def _configure_product_dropdowns(self, labels: List[str]) -> None:
-        values = labels or ["ETH-PERP", "ETH-USD", "NOL-18MAY26-CDE"]
+        values = labels or ["ETH-PERP", "ETH-USD", "BTC-USD", "NOL-18MAY26-CDE"]
         for name in ("product_id_entry", "setup_product_id_entry", "reference_product_entry", "setup_reference_product_entry", "trade_product_combo", "trade_reference_combo"):
             widget = getattr(self, name, None)
             if widget is not None and hasattr(widget, "configure"):
@@ -4848,7 +5010,7 @@ class App(ctk.CTk):
             label = safe_product_label(product)
             labels.append(label)
             mapping[label] = pid
-        for fallback in ("ETH-PERP", "ETH-USD", "NOL-18MAY26-CDE"):
+        for fallback in ("ETH-PERP", "ETH-USD", "BTC-USD", "NOL-18MAY26-CDE"):
             if fallback not in mapping.values():
                 labels.append(fallback)
                 mapping[fallback] = fallback
@@ -4867,7 +5029,7 @@ class App(ctk.CTk):
             def done() -> None:
                 self.available_products = products
                 self._refresh_product_dropdowns_from_products(products)
-                self._append_settings_status(f"Loaded {len(products)} Coinbase products into dropdowns. Oil futures product NOL-18MAY26-CDE is available.")
+                self._append_settings_status(f"Loaded {len(products)} Coinbase products into dropdowns, including available CFM futures for oil, equity/stock, ETF, and index underlyings when Coinbase returns them.")
             self.after(0, done)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5083,24 +5245,6 @@ class App(ctk.CTk):
     def unlock_secrets(self) -> None:
         self.ensure_secrets_unlocked()
 
-    def test_coinbase_auth_action(self) -> None:
-        raw_api_key = self.coinbase_api_key_entry.get().strip() if hasattr(self, "coinbase_api_key_entry") else ""
-        raw_private_key = self._get_private_key_value() if hasattr(self, "coinbase_private_key_box") else ""
-        api_key, private_key, notes = CoinbaseAdvancedClient.extract_coinbase_credentials(raw_api_key, raw_private_key)
-        if not api_key or not private_key:
-            if not self.ensure_secrets_unlocked():
-                return
-        else:
-            self.coinbase.set_secrets({"coinbase_api_key": api_key, "coinbase_private_key": private_key})
-        for note in notes:
-            self._append_settings_status(note)
-        ok, message = self.coinbase.test_authentication()
-        self._append_settings_status(message)
-        if ok:
-            messagebox.showinfo("Coinbase Auth", message)
-        else:
-            messagebox.showerror("Coinbase Auth Failed", message)
-
     def save_settings_action(self) -> None:
         self.settings.data["product_id"] = self._extract_product_id_from_widget(self.product_id_entry, "ETH-PERP")
         self.settings.data["reference_product_id"] = self._extract_product_id_from_widget(self.reference_product_entry, "ETH-USD")
@@ -5117,7 +5261,7 @@ class App(ctk.CTk):
         self.settings.data["autonomy_cooldown_seconds"] = max(20, int(safe_float(self.autonomy_cooldown_entry.get(), 420)))
         self.settings.data["margin_type"] = self.margin_type_combo.get().strip() or "CROSS"
         self.settings.data["model_path"] = self.model_path_entry.get().strip() or DEFAULT_MODEL_PATH
-        self.settings.data["jwt_algorithm"] = self.jwt_algo_combo.get().strip() or "AUTO"
+        self.settings.data["jwt_algorithm"] = self.jwt_algo_combo.get().strip() or "ES256"
 
         for switch, key in [
             (self.paper_mode_switch, "paper_trading_enabled"),
@@ -5441,7 +5585,7 @@ class App(ctk.CTk):
                     prompt,
                     temperature=float(self.settings.data.get("model_temperature", 0.20)),
                     top_p=float(self.settings.data.get("model_top_p", 0.90)),
-                    max_tokens=min(1200, int(self.settings.data.get("model_max_tokens", 1400))),
+                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 768)),
                 )
             else:
                 reply = (
@@ -5475,7 +5619,7 @@ class App(ctk.CTk):
                     prompt,
                     temperature=float(self.settings.data.get("model_temperature", 0.20)),
                     top_p=float(self.settings.data.get("model_top_p", 0.90)),
-                    max_tokens=int(self.settings.data.get("model_max_tokens", 1400)),
+                    max_tokens=clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 768)),
                 )
             else:
                 reply = (
@@ -5535,7 +5679,7 @@ class App(ctk.CTk):
                     image_path=image_path,
                     temperature=float(self.settings.data.get("model_temperature", 0.20)),
                     top_p=float(self.settings.data.get("model_top_p", 0.90)),
-                    max_tokens=min(800, int(self.settings.data.get("model_max_tokens", 1400))),
+                    max_tokens=min(700, clamp_litert_output_tokens(self.settings.data.get("model_max_tokens", 768))),
                 )
             else:
                 reply = (
