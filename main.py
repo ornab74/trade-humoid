@@ -72,7 +72,8 @@ except Exception as exc:
 APP_NAME = "Entropic Coinbase Quantum Intelligence"
 SETTINGS_PATH = Path("main_eth_perp_quantum_settings.json")
 PRODUCT_CACHE_DB_PATH = Path("coinbase_product_cache.sqlite3")
-MODEL_REPO = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/"
+MODEL_REVISION = "7fa1d78473894f7e736a21d920c3aa80f950c0db"
+MODEL_REPO = f"https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/{MODEL_REVISION}/"
 MODEL_FILE = "gemma-4-E2B-it.litertlm"
 EXPECTED_MODEL_SHA256 = "ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42"
 MODELS_DIR = Path("models")
